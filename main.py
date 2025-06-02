@@ -16,7 +16,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# Configura el cliente OpenAI
+# OpenAI config
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # ===== Firebase config =====
@@ -29,7 +29,6 @@ user_states = {}
 memory = {}
 reminders = []
 
-# Lista de campos requeridos (en orden)
 CAMPOS = [
     ("cliente", "¿Cuál es el nombre del cliente?"),
     ("num_cliente", "¿Cuál es el número del cliente (si aplica)?"),
@@ -111,10 +110,15 @@ Eres un asistente de agendas empresariales. Extrae de este mensaje los siguiente
 - fecha_hora
 - observaciones
 
-Si un campo no está presente, responde "FALTA".
+Si el mensaje NO es para agendar una cita, responde SOLO este JSON:
+{{
+  "casual": true
+}}
 
 Mensaje: \"{mensaje}\"
-Ejemplo de respuesta:
+Ejemplo de respuesta (casual):
+{{"casual": true}}
+Ejemplo de respuesta (agenda):
 {{
   "cliente": "Juan Perez",
   "num_cliente": "12345678",
@@ -167,8 +171,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No tienes reuniones/citas registradas hoy.")
         return
 
-    # ============= FLUJO PRINCIPAL: INTELIGENCIA DE AGENDA O CHAT ===========
-    # Primero: si el usuario está llenando un campo, sigue el flujo ordenado
+    # ===== INTELIGENCIA: Detectar si el usuario está en modo casual o agenda =====
+    # Si está llenando campos, sigue el flujo de agenda
+    completando = any([estado.get(campo, "") for campo, _ in CAMPOS])
+    if not completando:
+        # Si no hay ningún campo, primero intenta extraer campos del mensaje:
+        fields = gpt_extract_fields(text)
+        # Si GPT dice que es casual, responde como IA
+        if fields.get("casual"):
+            respuesta = openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": text}]
+            )
+            await update.message.reply_text(respuesta.choices[0].message.content)
+            return
+        # Si hay campos de agenda, precarga lo que se pueda
+        for campo, _ in CAMPOS:
+            if fields.get(campo) and fields[campo] != "FALTA":
+                estado[campo] = fields[campo]
+            else:
+                estado.setdefault(campo, "")
+
+    # Flujo de llenado ordenado
     faltante = None
     for campo, pregunta in CAMPOS:
         if campo not in estado or not estado[campo]:
@@ -176,24 +200,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if faltante:
-        # Si recién comienza o está llenando campo por campo
-        if not any(estado.values()):
-            # Extraer automáticamente los campos si el mensaje es largo (ej: todos los datos en 1 solo mensaje)
-            fields = gpt_extract_fields(text)
-            for campo, _ in CAMPOS:
-                if fields.get(campo) and fields[campo] != "FALTA":
-                    estado[campo] = fields[campo]
-                else:
-                    estado.setdefault(campo, "")
-        else:
-            # El usuario está completando un campo específico, guarda lo que acaba de responder
+        # El usuario está completando un campo específico, guarda lo que acaba de responder
+        if completando:
             estado[faltante] = text
-
-        # Si todavía falta algo, pregúntalo en orden
         completos = await solicitar_dato(update, estado)
         if not completos:
             return
-
     else:
         # Si ya tiene todo, agenda y limpia estado
         cliente = estado["cliente"]
@@ -229,7 +241,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Observaciones: {observaciones}\n"
             "Recibirás recordatorios automáticos antes de la cita."
         )
-        # Agrega recordatorio automático
         try:
             reminders.append({
                 "id": len(reminders)+2,
@@ -243,17 +254,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("No se pudo programar recordatorio automático:", e)
         user_states[user_id] = {}
         update_memory(user_id, text, f"Registro completado para {cliente}")
-        return
-
-    # === FLUJO SECUNDARIO: CHAT NORMAL GPT ===
-    # Si no estamos llenando una agenda, responde casual
-    if not any(estado.values()) and not faltante:
-        respuesta = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": text}]
-        )
-        await update.message.reply_text(respuesta.choices[0].message.content)
-        return
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
