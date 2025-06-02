@@ -65,7 +65,7 @@ async def reminder_job(application):
                     if not r.get("reportado"):
                         await application.bot.send_message(
                             chat_id=r["chat_id"],
-                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['id']} [detalle]"
+                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['row']} <observaciones>"
                         )
                         r["reportado"] = True
             await asyncio.sleep(60)
@@ -109,11 +109,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rec_id.isdigit():
                 row_idx = int(rec_id)
                 sheet.update_cell(row_idx, 7, detalle) # Columna G: Observaciones del recordatorio
-                await update.message.reply_text("📝 ¡Reporte guardado! Gracias.")
+                await update.message.reply_text("📝 ¡Reporte/Observación guardada! Gracias.")
             else:
                 await update.message.reply_text("ID inválido. Usa el número de fila del Sheet.")
         except Exception:
-            await update.message.reply_text("❌ No se pudo registrar el reporte. Usa: reporte <fila> <detalle>")
+            await update.message.reply_text("❌ No se pudo registrar la observación. Usa: reporte <fila> <observaciones>")
         return
 
     # === Consulta de reuniones/citas del día ===
@@ -134,9 +134,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ==== IA GPT ====
     system_content = (
-        "Eres un asistente para gestión de recordatorios y CRM. Si el usuario agenda una cita, extrae: nombre del cliente, número de cliente, proyecto, modalidad, fecha y hora."
-        "Después de cada cita, pide un reporte de lo sucedido."
-        "Si el usuario confirma/agrega una cita, indícalo con frases como 'La cita ha sido agendada' o 'Recordatorio creado'."
+        "Eres un asistente para gestión de recordatorios y CRM. Si el usuario agenda una cita, extrae: nombre del cliente, número de cliente, proyecto, modalidad, fecha y hora. "
+        "Después de cada cita, pide un reporte de lo sucedido. "
+        "Si el usuario confirma/agrega una cita, indícalo con frases como 'La cita ha sido agendada' o 'Recordatorio creado'. "
+        "Pide siempre al usuario observaciones o detalles para el campo OBSERVACIONES DEL RECORDATORIO después de la cita. "
         "Si no hay contexto de CRM, responde normalmente."
     )
     messages = [{"role": "system", "content": system_content}]
@@ -220,4 +221,3 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     loop.create_task(reminder_job(app))
     app.run_polling()
-
