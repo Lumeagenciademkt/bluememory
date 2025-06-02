@@ -21,101 +21,149 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- Función: Extrae posible fecha/hora del mensaje (mejorar a futuro) ---
-def extraer_fecha_hora(texto):
-    # Ejemplo: "2pm 02/06/2025", "3pm 2 de junio de 2025", "mañana a las 10"
-    # Para demo: solo 24h o fechas claras tipo "02/06/2025 15:00"
-    match = re.search(r'(\d{1,2}[:h]?\d{0,2})\s*(am|pm)?[ ,de]*([\d/]+)?', texto, re.IGNORECASE)
-    if match:
-        hora = match.group(1)
-        ampm = match.group(2) or ""
-        fecha = match.group(3) or datetime.now().strftime("%d/%m/%Y")
-        # Normaliza hora
-        if ":" not in hora:
-            hora = hora + ":00"
-        # Convierte fecha al formato yyyy-mm-dd
-        if "/" in fecha:
-            dia, mes, año = fecha.split("/")
-            fecha_fmt = f"{año}-{mes.zfill(2)}-{dia.zfill(2)}"
-        else:
-            fecha_fmt = datetime.now().strftime("%Y-%m-%d")
-        # Convierte a datetime final
-        try:
-            hora_24 = datetime.strptime(hora + ampm, "%I:%M%p").strftime("%H:%M")
-        except:
-            hora_24 = hora
-        return f"{fecha_fmt} {hora_24}"
-    return None
+# --- CAMPOS PARA RECORDATORIOS ---
+RECORDATORIO_CAMPOS = [
+    ("cliente", "¿Cuál es el nombre del cliente?"),
+    ("num_cliente", "¿Cuál es el número del cliente (si aplica)?"),
+    ("proyecto", "¿Sobre qué proyecto es la reunión o cita?"),
+    ("modalidad", "¿Modalidad? (presencial, virtual, reagendar llamada, etc)"),
+    ("fecha_hora", "¿Fecha y hora de la cita? (Ej: 2025-06-02 18:00)"),
+    ("motivo", "¿Motivo o asunto del recordatorio?"),
+    ("observaciones", "¿Alguna observación o detalle especial para este recordatorio? (puedes poner '-' si no hay)"),
+]
 
-# --- Manejo de mensajes ---
+user_recordatorio = {}  # Guarda temporalmente la info por usuario
+
+# --- EXTRAER FECHA Y HORA CON VERSATILIDAD ---
+def parsear_fecha(texto):
+    # Soporta: hoy, mañana, fechas, horas sueltas, etc
+    texto = texto.lower()
+    ahora = datetime.now()
+    if "mañana" in texto:
+        fecha = ahora + timedelta(days=1)
+        return fecha.strftime("%Y-%m-%d")
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
+    if match:
+        return match.group(1)
+    match2 = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", texto)
+    if match2:
+        d, m, y = match2.group(1).split("/")
+        return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+    return ahora.strftime("%Y-%m-%d")
+
+def parsear_hora(texto):
+    match = re.search(r"(\d{1,2})(?:[:h](\d{2}))?\s*(am|pm)?", texto)
+    if match:
+        hora = int(match.group(1))
+        minutos = int(match.group(2) or 0)
+        ampm = match.group(3)
+        if ampm:
+            if ampm.lower() == "pm" and hora < 12:
+                hora += 12
+            elif ampm.lower() == "am" and hora == 12:
+                hora = 0
+        return f"{hora:02}:{minutos:02}"
+    return "09:00"  # Hora por defecto
+
+def extraer_fecha_hora(texto):
+    # "mañana a las 3pm" -> 2025-06-03 15:00
+    fecha = parsear_fecha(texto)
+    hora = parsear_hora(texto)
+    return f"{fecha} {hora}"
+
+# --- FLUJO DE GUARDADO DE RECORDATORIO (UNO A UNO) ---
+async def pedir_siguiente_dato(user_id, update, estado):
+    for campo, pregunta in RECORDATORIO_CAMPOS:
+        if campo not in estado or not estado[campo]:
+            await update.message.reply_text(pregunta)
+            return campo
+    return None  # Todos los campos completos
+
+async def completar_recordatorio(update: Update, estado):
+    # Guarda en Firestore y limpia el estado del usuario
+    db.collection("recordatorios").add(estado)
+    await update.message.reply_text("✅ Recordatorio guardado. Pronto te avisaré aquí mismo.")
+    user_recordatorio.pop(update.message.from_user.id, None)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
     user_name = user.username or ""
-    text = update.message.text.strip().lower()
+    text = update.message.text.strip()
 
-    # --- Reconoce comandos simples ---
-    # Guardar recordatorio sencillo
-    if "agenda" in text or "recordar" in text or "cita" in text:
-        # Ejemplo: "Agendame una cita con Jose mañana a las 2pm"
-        # Simple parsing
-        fecha_hora = extraer_fecha_hora(text)
-        motivo = ""
-        cliente = ""
-        proyecto = ""
-        modalidad = ""
-        observaciones = ""
-
-        # Extrae cliente (palabra después de "con")
-        if "con" in text:
-            cliente = text.split("con",1)[1].split()[0:3]
-            cliente = " ".join(cliente)
-
-        # Extrae motivo después de "para"
-        if "para" in text:
-            motivo = text.split("para",1)[1].split()[0:8]
-            motivo = " ".join(motivo)
-
-        # Si no se detectó fecha/hora clara, pide al usuario la fecha
-        if not fecha_hora:
-            await update.message.reply_text("¿Para cuándo es el recordatorio? (Ej: 02/06/2025 15:00)")
-            return
-
-        # Guarda en Firestore
-        db.collection("recordatorios").add({
-            "user_id": user_id,
-            "usuario": user.full_name,
-            "cliente": cliente,
-            "fecha_hora": fecha_hora,
-            "motivo": motivo,
-            "proyecto": proyecto,
-            "modalidad": modalidad,
-            "observaciones": observaciones,
-        })
-        await update.message.reply_text("✅ Recordatorio guardado. Pronto te avisaré aquí mismo.")
-
+    # --- FLUJO DE CAPTURA DE RECORDATORIO EN CURSO ---
+    if user_id in user_recordatorio:
+        estado = user_recordatorio[user_id]
+        campo_actual = next((c for c, _ in RECORDATORIO_CAMPOS if not estado.get(c)), None)
+        if campo_actual:
+            estado[campo_actual] = text
+            # Pide el siguiente campo pendiente
+            siguiente = await pedir_siguiente_dato(user_id, update, estado)
+            if not siguiente:
+                # Si ya está completo
+                estado["user_id"] = user_id
+                estado["usuario"] = user.full_name
+                await completar_recordatorio(update, estado)
         return
 
-    # Consultar recordatorios de HOY o una fecha específica
-    if "recordatorio" in text and ("hoy" in text or "tengo" in text or "pendiente" in text or "reunión" in text):
-        # Consulta de Firestore
-        hoy = datetime.now().strftime("%Y-%m-%d")
+    # --- INICIO: FLUJO DE AGENDADO ---
+    if any(w in text.lower() for w in ["agenda", "recordar", "cita"]):
+        # Intenta extraer algunos campos directamente
+        estado = {c: "" for c, _ in RECORDATORIO_CAMPOS}
+        estado["user_id"] = user_id
+        estado["usuario"] = user.full_name
+
+        # Extrae info básica automática (mejorable con GPT, aquí simple)
+        if "con" in text.lower():
+            try:
+                estado["cliente"] = text.lower().split("con", 1)[1].split()[0:3]
+                estado["cliente"] = " ".join(estado["cliente"])
+            except: pass
+        if "para" in text.lower():
+            try:
+                estado["motivo"] = text.lower().split("para", 1)[1].split()[0:8]
+                estado["motivo"] = " ".join(estado["motivo"])
+            except: pass
+        # Fecha/hora
+        if any(w in text.lower() for w in ["hoy", "mañana", "pm", "am", "/", "-"]):
+            estado["fecha_hora"] = extraer_fecha_hora(text)
+        # Pregunta los campos faltantes
+        user_recordatorio[user_id] = estado
+        await pedir_siguiente_dato(user_id, update, estado)
+        return
+
+    # --- CONSULTA DE RECORDATORIOS POR FECHA ---
+    if ("recordatorio" in text.lower() or "pendiente" in text.lower() or "reunión" in text.lower()) and ("hoy" in text.lower() or "mañana" in text.lower() or re.search(r"\d{1,2}/\d{1,2}/\d{4}", text) or re.search(r"\d{4}-\d{2}-\d{2}", text)):
+        # Determina fecha buscada
+        fecha_buscar = parsear_fecha(text)
         docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
         lista = []
         for doc in docs:
             data = doc.to_dict()
-            # Filtra por fecha de hoy
-            fecha_txt = data.get("fecha_hora","")
-            if fecha_txt.startswith(hoy):
-                lista.append(f"{data.get('fecha_hora','')} - {data.get('motivo','')} {data.get('cliente','')}")
+            if data.get("fecha_hora", "").startswith(fecha_buscar):
+                desc = f"{data.get('fecha_hora', '')} - cliente {data.get('cliente', '')} - motivo: {data.get('motivo', '')}"
+                lista.append(desc)
         if lista:
-            await update.message.reply_text("📅 Tus recordatorios para hoy:\n" + "\n".join(lista))
+            await update.message.reply_text("📅 Tus recordatorios para " + fecha_buscar + ":\n" + "\n".join(lista))
         else:
-            await update.message.reply_text("No tienes recordatorios para hoy.")
+            await update.message.reply_text(f"No tienes recordatorios para {fecha_buscar}.")
         return
 
-    # --- Chat IA normal (Blue) ---
-    # Personalidad
+    if "recordatorio" in text.lower() and "tengo" in text.lower():
+        # Lista TODOS los recordatorios
+        docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
+        lista = []
+        for doc in docs:
+            data = doc.to_dict()
+            desc = f"{data.get('fecha_hora','')} - cliente {data.get('cliente','')} - motivo: {data.get('motivo','')}"
+            lista.append(desc)
+        if lista:
+            await update.message.reply_text("📅 Todos tus recordatorios:\n" + "\n".join(lista))
+        else:
+            await update.message.reply_text("No tienes ningún recordatorio guardado.")
+        return
+
+    # --- CHAT NORMAL GPT-4o (BLUE) ---
     system_prompt = (
         "Eres Blue, un asistente personal para organización en Telegram. "
         "Tu objetivo principal es ayudar al usuario a organizar su día, agendar recordatorios y citas, "
