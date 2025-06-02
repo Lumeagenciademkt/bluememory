@@ -10,30 +10,95 @@ import pytz
 import re
 import json
 
-# --- Configuración inicial ---
+# --- Cargar variables de entorno ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 openai.api_key = OPENAI_API_KEY
 
-# --- Firebase ---
+# --- Inicializa Firebase ---
 if not firebase_admin._apps:
     cred = credentials.Certificate(GOOGLE_CREDS_JSON)
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- Campos a solicitar ---
-RECORDATORIO_CAMPOS = [
-    "cliente", "num_cliente", "proyecto", "modalidad",
-    "fecha_hora", "motivo", "observaciones"
+# --- Estados de usuario en RAM ---
+user_states = {}
+
+# --- Campos y plantilla para recordatorios ---
+CAMPOS = [
+    "cliente", "num_cliente", "proyecto", "modalidad", "fecha_hora", "motivo", "observaciones"
 ]
 
-# --- GPT extraction: separa y normaliza los campos del mensaje del usuario ---
+def plantilla_recordatorio():
+    return (
+        "¡Perfecto! Para guardar tu recordatorio, necesito esto (responde todo junto, en cualquier orden):\n"
+        "- Cliente\n"
+        "- Número de cliente\n"
+        "- Proyecto\n"
+        "- Modalidad (presencial/virtual)\n"
+        "- Fecha y hora\n"
+        "- Motivo\n"
+        "- Observaciones\n\n"
+        "Ejemplo: Juan Pérez, 98798798, Proyecto Malabrigo, presencial, 6 de junio 3pm, venta de lote, obs: revisar contrato"
+    )
+
+# --- Normaliza fechas humanas a formato ISO (YYYY-MM-DD HH:MM) ---
+def normaliza_fecha(texto):
+    texto = texto.lower().strip()
+    tz = pytz.timezone('America/Lima')
+    now = datetime.now(tz)
+    if "mañana" in texto:
+        base = now + timedelta(days=1)
+        texto = texto.replace("mañana", base.strftime("%Y-%m-%d"))
+    if "hoy" in texto:
+        texto = texto.replace("hoy", now.strftime("%Y-%m-%d"))
+    # Detecta fechas tipo 6 de junio 3pm
+    meses = {
+        "enero":"01", "febrero":"02", "marzo":"03", "abril":"04", "mayo":"05", "junio":"06",
+        "julio":"07", "agosto":"08", "septiembre":"09", "octubre":"10", "noviembre":"11", "diciembre":"12"
+    }
+    m = re.search(r'(\d{1,2})\s*de\s*(\w+)\s*(\d{1,2})?(am|pm)?', texto)
+    if m:
+        dia = m.group(1)
+        mes = m.group(2)
+        hora = m.group(3) or "00"
+        ampm = m.group(4) or ""
+        año = str(now.year)
+        if mes in meses:
+            mes_num = meses[mes]
+            if ampm:
+                hora_int = int(hora)
+                if ampm == "pm" and hora_int < 12:
+                    hora_int += 12
+                if ampm == "am" and hora_int == 12:
+                    hora_int = 0
+                hora = f"{hora_int:02d}:00"
+            else:
+                hora = f"{int(hora):02d}:00"
+            return f"{año}-{mes_num}-{int(dia):02d} {hora}"
+    # Busca YYYY-MM-DD HH:MM o DD/MM/YYYY HH:MM
+    for fmt in ["%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"]:
+        try:
+            fecha = datetime.strptime(texto, fmt)
+            return fecha.strftime("%Y-%m-%d %H:%M")
+        except: continue
+    # Si solo hora: "3pm"
+    m = re.match(r'(\d{1,2})(am|pm)', texto)
+    if m:
+        hora = int(m.group(1))
+        if m.group(2) == 'pm' and hora < 12: hora += 12
+        if m.group(2) == 'am' and hora == 12: hora = 0
+        return now.strftime("%Y-%m-%d ") + f"{hora:02d}:00"
+    return texto  # si falla, devuelve igual
+
+# --- GPT Extraction mejorada ---
 def gpt_parse_recordatorio(texto_usuario):
     prompt = f"""
-Eres un experto organizador. Extrae los siguientes campos del mensaje (pueden estar en cualquier orden):
+Eres un asistente para organizar agendas empresariales. Un usuario te dará varios datos sobre un recordatorio, en frases, líneas, bullets o cualquier orden. Interpreta y extrae los campos, aunque estén separados por saltos de línea.
 
+Devuelve SOLO un JSON válido con estos campos:
 - cliente
 - num_cliente
 - proyecto
@@ -42,16 +107,31 @@ Eres un experto organizador. Extrae los siguientes campos del mensaje (pueden es
 - motivo
 - observaciones
 
-Devuelve SOLO un JSON válido con los campos. Si falta alguno, pon "FALTA".
+Ejemplo de entrada válida:
+'''
+Juan Perez
+98789898
+Malabrigo
+presencial
+6 de junio 3pm
+Venta lote
+obs: revisar contrato
+'''
+Respuesta:
+{{
+  "cliente": "Juan Perez",
+  "num_cliente": "98789898",
+  "proyecto": "Malabrigo",
+  "modalidad": "presencial",
+  "fecha_hora": "6 de junio 3pm",
+  "motivo": "Venta lote",
+  "observaciones": "revisar contrato"
+}}
 
-Ejemplo:
-Usuario: Juan Pérez, 98789898, proyecto Malabrigo, presencial, 6 de junio 3pm, venta de lote, obs: revisar contrato
-
-{{"cliente": "Juan Pérez", "num_cliente": "98789898", "proyecto": "Malabrigo", "modalidad": "presencial", "fecha_hora": "6 de junio 3pm", "motivo": "venta de lote", "observaciones": "revisar contrato"}}
-
-Ahora procesa este mensaje:
-{texto_usuario}
-    """
+Ahora interpreta y extrae del siguiente texto:
+'''{texto_usuario}'''
+Responde SOLO con el JSON.
+"""
     resp = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}]
@@ -60,249 +140,139 @@ Ahora procesa este mensaje:
     try:
         campos = json.loads(content)
     except Exception:
-        campos = {}
+        # Limpiar si viene con markdown o saltos
+        content = content.replace("\n", "").replace("```json", "").replace("```", "")
+        try:
+            campos = json.loads(content)
+        except Exception:
+            campos = {}
     return campos
 
-# --- Normaliza y parsea fechas ---
-def normaliza_fecha(texto):
-    tz = pytz.timezone('America/Lima')
-    now = datetime.now(tz)
+# --- Chequea campos faltantes ---
+def campos_faltantes(campos):
+    return [c for c in CAMPOS if not campos.get(c)]
 
-    # Reemplaza 'hoy', 'mañana'
-    if "mañana" in texto.lower():
-        base = now + timedelta(days=1)
-        texto = texto.lower().replace("mañana", base.strftime("%Y-%m-%d"))
-    if "hoy" in texto.lower():
-        texto = texto.lower().replace("hoy", now.strftime("%Y-%m-%d"))
-
-    # Detección robusta de fechas comunes
-    patrones = [
-        (r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})[ ,a]*([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)?", "%d/%m/%Y %I:%M%p"), # 06/06/2025 3:00pm
-        (r"(\d{1,2}) de (\w+) de (\d{4})[ ,a]*([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)?", None), # 6 de junio de 2025 3pm
-        (r"(\d{4})-(\d{2})-(\d{2})[ ,a]*([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)?", "%Y-%m-%d %I:%M%p"), # 2025-06-06 3:00pm
-        (r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", "%d/%m/%Y"), # 06/06/2025
-        (r"(\d{4})-(\d{2})-(\d{2})", "%Y-%m-%d"), # 2025-06-06
-    ]
-
-    meses = {
-        "enero":"01", "febrero":"02", "marzo":"03", "abril":"04", "mayo":"05", "junio":"06",
-        "julio":"07", "agosto":"08", "septiembre":"09", "setiembre":"09",
-        "octubre":"10", "noviembre":"11", "diciembre":"12"
-    }
-
-    # 6 de junio de 2025 3pm, 6 de junio 3pm, etc.
-    m = re.search(r"(\d{1,2})\s+de\s+(\w+)(?:\s+de\s+(\d{4}))?(?:\s+a\s+las)?\s*([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)?", texto, re.IGNORECASE)
-    if m:
-        dia, mes_str, año, hora, minuto, ampm = m.groups()
-        mes = meses.get(mes_str.lower(), None)
-        if not año:
-            año = str(now.year)
-        if not mes:
-            return texto
-        minuto = minuto or "00"
-        hora = int(hora)
-        if ampm:
-            if ampm.lower() == "pm" and hora < 12:
-                hora += 12
-            if ampm.lower() == "am" and hora == 12:
-                hora = 0
-        try:
-            fecha_final = datetime(int(año), int(mes), int(dia), hora, int(minuto))
-            return fecha_final.strftime("%Y-%m-%d %H:%M")
-        except:
-            return texto
-
-    # Por patrones
-    for patron, formato in patrones:
-        m = re.search(patron, texto, re.IGNORECASE)
-        if m:
-            grupos = m.groups()
-            if "de" in patron:
-                # 6 de junio de 2025 3pm
-                continue
-            datos = [g or "00" for g in grupos]
-            if formato and ("%p" in formato or "%I" in formato):
-                if len(datos) >= 6:
-                    dia, mes, año, hora, minuto, ampm = datos
-                    hora = int(hora)
-                    if ampm and ampm.lower() == "pm" and hora < 12:
-                        hora += 12
-                    if ampm and ampm.lower() == "am" and hora == 12:
-                        hora = 0
-                    fecha_final = datetime(int(año), int(mes), int(dia), hora, int(minuto))
-                else:
-                    dia, mes, año = datos[:3]
-                    hora, minuto = datos[3:5]
-                    fecha_final = datetime(int(año), int(mes), int(dia), int(hora), int(minuto))
-            elif formato:
-                fecha_final = datetime.strptime(" ".join(datos), formato)
-            else:
-                continue
-            return fecha_final.strftime("%Y-%m-%d %H:%M")
-
-    # Si solo es hora
-    m = re.search(r"([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)?", texto)
-    if m:
-        h, mn, ampm = m.groups()
-        h = int(h)
-        mn = int(mn or 0)
-        if ampm:
-            if ampm.lower() == "pm" and h < 12: h += 12
-            if ampm.lower() == "am" and h == 12: h = 0
-        return now.replace(hour=h, minute=mn).strftime("%Y-%m-%d %H:%M")
-
-    # No pudo parsear, devuelve texto original
-    return texto
-
-# --- Consulta recordatorios por fecha (YYYY-MM-DD) ---
-def consulta_recordatorios(user_id, fecha):
+# --- Consulta por fecha (YYYY-MM-DD) ---
+def consulta_recordatorios(user_id, fecha_buscada):
     docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
-    lista = []
+    result = []
     for doc in docs:
         data = doc.to_dict()
-        fh = data.get("fecha_hora", "")
-        # filtra por fecha exacta (primeros 10 chars ISO)
-        if fh and fh[:10] == fecha:
-            desc = f"{fh} - {data.get('motivo','')} {data.get('cliente','')}"
-            lista.append(desc)
-    return lista
+        fecha_hora = data.get("fecha_hora", "")
+        if fecha_hora.startswith(fecha_buscada):
+            result.append(data)
+    return result
 
 # --- Handler principal ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
-    user_name = user.username or user.first_name or "usuario"
     text = update.message.text.strip()
+    user_name = user.username or user.full_name or "usuario"
+    tz = pytz.timezone('America/Lima')
+    now = datetime.now(tz)
 
-    # Paso 1: INICIAR CREACIÓN DE RECORDATORIO (si no estamos ya en proceso)
-    if not context.user_data.get("esperando_formulario") and any(w in text.lower() for w in ["agenda", "recordar", "nuevo recordatorio", "cita", "reunión"]):
-        context.user_data["esperando_formulario"] = True
-        await update.message.reply_text(
-            "¡Perfecto! Para guardar tu recordatorio, necesito esto (responde todo junto, en cualquier orden):\n"
-            "- Cliente\n- Número de cliente\n- Proyecto\n- Modalidad (presencial/virtual)\n"
-            "- Fecha y hora\n- Motivo\n- Observaciones\n\n"
-            "Ejemplo: Juan Pérez, 98798798, Proyecto Malabrigo, presencial, 6 de junio 3pm, venta de lote, obs: revisar contrato"
-        )
+    # 1. Estado: ¿está llenando recordatorio?
+    estado = user_states.get(user_id, {})
+    if estado.get("en_recordatorio"):
+        # Espera todos los campos juntos (o los que faltan)
+        last_campos = estado.get("campos", {})
+        nuevos = gpt_parse_recordatorio(text)
+        # Actualiza campos ya llenados
+        for k in CAMPOS:
+            if nuevos.get(k) and nuevos.get(k) != "FALTA":
+                last_campos[k] = nuevos[k]
+        # Normaliza fecha si ya está
+        if last_campos.get("fecha_hora"):
+            last_campos["fecha_hora"] = normaliza_fecha(last_campos["fecha_hora"])
+        faltan = campos_faltantes(last_campos)
+        if faltan:
+            # Pide solo lo que falta
+            await update.message.reply_text(
+                f"Faltan estos campos: {', '.join(faltan)}.\nResponde solo los que faltan, en cualquier orden."
+            )
+            estado["campos"] = last_campos
+            user_states[user_id] = estado
+            return
+        # TODO: verificación visual (opcional)
+        resumen = "\n".join([f"{k.capitalize()}: {last_campos[k]}" for k in CAMPOS])
+        await update.message.reply_text(f"¡Perfecto! ¿Confirmas guardar este recordatorio?\n\n{resumen}\n\nResponde SÍ para guardar o NO para cancelar.")
+        estado["campos"] = last_campos
+        estado["confirmar"] = True
+        user_states[user_id] = estado
         return
 
-    # Paso 2: ESPERANDO RESPUESTA DEL FORMULARIO
-    if context.user_data.get("esperando_formulario"):
-        campos = gpt_parse_recordatorio(text)
-        # Normaliza fecha si la detecta
-        if campos.get("fecha_hora") and campos["fecha_hora"] != "FALTA":
-            campos["fecha_hora"] = normaliza_fecha(campos["fecha_hora"])
-        # Detecta campos faltantes
-        faltantes = [c for c in RECORDATORIO_CAMPOS if not campos.get(c) or campos[c] == "FALTA"]
-        preview = "\n".join([f"{k.capitalize()}: {campos.get(k,'')}" for k in RECORDATORIO_CAMPOS])
-        if not faltantes:
-            # Listo para confirmar
-            context.user_data["campos_previos"] = campos
-            context.user_data["esperando_formulario"] = False
-            context.user_data["esperando_confirmacion"] = True
-            await update.message.reply_text(
-                f"Voy a guardar este recordatorio:\n{preview}\n\n¿Está correcto? (Responde 'sí' para guardar o responde con las correcciones/faltantes)"
-            )
-        else:
-            context.user_data["campos_previos"] = campos
-            await update.message.reply_text(
-                f"Faltan estos campos: {', '.join(faltantes)}\nResponde solo los que faltan, en cualquier orden."
-            )
-        return
-
-    # Paso 3: ESPERANDO CONFIRMACIÓN O CORRECCIÓN
-    if context.user_data.get("esperando_confirmacion"):
-        if text.strip().lower() in ["sí", "si", "ok", "guardar", "conforme"]:
-            campos = context.user_data.get("campos_previos", {})
+    if estado.get("confirmar"):
+        # Esperando confirmación del usuario
+        if text.strip().lower() == "sí":
+            campos = estado.get("campos", {})
             db.collection("recordatorios").add({
                 "user_id": user_id,
                 "usuario": user_name,
-                **campos
+                **{k: campos.get(k, "") for k in CAMPOS},
             })
-            await update.message.reply_text("✅ Recordatorio guardado y ordenado. ¡Te avisaré aquí mismo!")
-            context.user_data.clear()
-            return
+            await update.message.reply_text("✅ Recordatorio guardado. Te avisaré aquí mismo cuando sea la fecha.")
+            user_states[user_id] = {}
         else:
-            # El usuario puede escribir solo lo faltante o corregido
-            campos = context.user_data.get("campos_previos", {})
-            nuevos_campos = gpt_parse_recordatorio(text)
-            campos.update({k: v for k, v in nuevos_campos.items() if v and v != "FALTA"})
-            # Normaliza fecha si viene corregida
-            if campos.get("fecha_hora"):
-                campos["fecha_hora"] = normaliza_fecha(campos["fecha_hora"])
-            preview = "\n".join([f"{k.capitalize()}: {campos.get(k,'')}" for k in RECORDATORIO_CAMPOS])
-            faltantes = [c for c in RECORDATORIO_CAMPOS if not campos.get(c) or campos[c] == "FALTA"]
-            if not faltantes:
-                context.user_data["campos_previos"] = campos
-                await update.message.reply_text(
-                    f"¡Genial! Así quedaría:\n{preview}\n\n¿Está correcto? (Responde 'sí' para guardar)"
-                )
-            else:
-                context.user_data["campos_previos"] = campos
-                await update.message.reply_text(
-                    f"Aún faltan: {', '.join(faltantes)}. Completa o corrige lo que falta:"
-                )
-            return
+            await update.message.reply_text("Registro cancelado. Si quieres crear otro recordatorio, solo dímelo.")
+            user_states[user_id] = {}
+        return
 
-    # Paso 4: CONSULTA DE RECORDATORIOS POR FECHA
-    if any(w in text.lower() for w in ["recordatorio", "pendiente", "reunión", "citas"]):
-        tz = pytz.timezone('America/Lima')
-        now = datetime.now(tz)
+    # 2. Nueva solicitud de recordatorio
+    if any(x in text.lower() for x in ["agenda", "recordar", "cita", "reunión", "recordatorio"]):
+        await update.message.reply_text(plantilla_recordatorio())
+        user_states[user_id] = {"en_recordatorio": True, "campos": {}}
+        return
+
+    # 3. Consulta de recordatorios por fecha (natural o ISO)
+    if any(x in text.lower() for x in ["qué recordatorio", "qué tengo", "pendiente", "reunión"]) or re.search(r'\d{1,2} de \w+|\d{4}-\d{2}-\d{2}', text):
+        # Intentar extraer fecha
         fecha_buscada = None
-        if "mañana" in text.lower():
-            fecha_buscada = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        elif "hoy" in text.lower():
-            fecha_buscada = now.strftime("%Y-%m-%d")
-        else:
-            # Busca fecha tipo '6 de junio', '2025-06-06', '06/06/2025', 'junio 6', etc.
-            fecha_patrones = [
-                (r"(\d{1,2})\s+de\s+(\w+)", "%d %B"),       # 6 de junio
-                (r"(\d{4})-(\d{2})-(\d{2})", "%Y-%m-%d"),   # 2025-06-06
-                (r"(\d{1,2})/(\d{1,2})/(\d{4})", "%d/%m/%Y") # 06/06/2025
-            ]
+        m1 = re.search(r'(\d{1,2})\s*de\s*(\w+)', text.lower())
+        m2 = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+        if m2:
+            fecha_buscada = m2.group(1)
+        elif m1:
+            # Convierte a ISO
             meses = {
                 "enero":"01", "febrero":"02", "marzo":"03", "abril":"04", "mayo":"05", "junio":"06",
-                "julio":"07", "agosto":"08", "septiembre":"09", "setiembre":"09",
-                "octubre":"10", "noviembre":"11", "diciembre":"12"
+                "julio":"07", "agosto":"08", "septiembre":"09", "octubre":"10", "noviembre":"11", "diciembre":"12"
             }
-            for patron, fmt in fecha_patrones:
-                m = re.search(patron, text, re.IGNORECASE)
-                if m:
-                    if fmt == "%d %B":
-                        dia, mes_str = m.groups()
-                        mes = meses.get(mes_str.lower())
-                        if mes:
-                            fecha_buscada = f"{now.year}-{mes}-{str(dia).zfill(2)}"
-                            break
-                    elif fmt == "%Y-%m-%d":
-                        fecha_buscada = m.group(0)
-                        break
-                    elif fmt == "%d/%m/%Y":
-                        dia, mes, año = m.groups()
-                        fecha_buscada = f"{año}-{str(mes).zfill(2)}-{str(dia).zfill(2)}"
-                        break
-        # Si no detecta fecha, asume hoy
-        if not fecha_buscada:
+            dia = int(m1.group(1))
+            mes = meses.get(m1.group(2), now.strftime("%m"))
+            fecha_buscada = f"{now.year}-{mes}-{dia:02d}"
+        elif "mañana" in text.lower():
+            fecha_buscada = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
             fecha_buscada = now.strftime("%Y-%m-%d")
         recordatorios = consulta_recordatorios(user_id, fecha_buscada)
         if recordatorios:
-            await update.message.reply_text("📅 Tus recordatorios para esa fecha:\n" + "\n".join(recordatorios))
+            lista = [
+                f"{r.get('fecha_hora','')} - {r.get('motivo','')} {r.get('cliente','')}"
+                for r in recordatorios
+            ]
+            await update.message.reply_text("📅 Tus recordatorios para esa fecha:\n" + "\n".join(lista))
         else:
             await update.message.reply_text("No tienes recordatorios para esa fecha.")
         return
 
-    # MODO CHATGPT NORMAL para cualquier otra consulta
+    # 4. Chat normal IA
     system_prompt = (
-        "Eres Blue, un asistente personal de productividad y recordatorios en Telegram, "
-        "especializado en ayudar a organizar y recordar citas, pendientes, reuniones y tareas. "
-        "Además, eres un chatbot IA capaz de responder cualquier pregunta o conversación general."
+        "Eres Blue, un asistente personal de productividad en Telegram. "
+        "Tu función principal es ayudar a organizar, agendar recordatorios y citas, y responder cualquier duda de forma amigable. "
+        "Si la consulta es de organización o gestión, ofrece ayuda proactiva; si es general, responde como un chatbot útil."
     )
-    resp = openai.chat.completions.create(
+    response = openai.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "system", "content": system_prompt},{"role": "user", "content": text}]
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ]
     )
-    gpt_reply = resp.choices[0].message.content.strip()
+    gpt_reply = response.choices[0].message.content.strip()
     await update.message.reply_text(gpt_reply)
-    # Guarda chat
+
+    # Guarda chat en firestore
     db.collection("chats").add({
         "user_id": user_id,
         "user_name": user_name,
@@ -314,6 +284,5 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Blue listo: recordatorios perfectos, consultas IA, y búsquedas por fecha al 100%.")
+    print("🤖 Blue listo, con extracción flexible y confirmación de recordatorios.")
     app.run_polling()
-
