@@ -21,15 +21,30 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+# --- Mensaje de sistema: rol de Blue ---
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": (
+        "Eres Blue, un asistente de inteligencia artificial para Telegram. "
+        "Tu objetivo principal es ayudar a las personas a organizarse, recordar sus pendientes, "
+        "citas y reuniones. Responde siempre de manera amigable y práctica. "
+        "Puedes conversar de cualquier tema si el usuario lo desea, pero recuerda que eres experto "
+        "en organización, productividad, recordatorios y agenda personal."
+    )
+}
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
     text = update.message.text
 
-    # Envía el mensaje del usuario a GPT-4o
+    # Envía el mensaje del usuario a GPT-4o con el rol de Blue
     response = openai.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "user", "content": text}]
+        messages=[
+            SYSTEM_PROMPT,
+            {"role": "user", "content": text}
+        ]
     )
     gpt_reply = response.choices[0].message.content.strip()
 
@@ -47,5 +62,5 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Bot listo y corriendo solo como chat.")
+    print("🤖 Blue está listo para ayudarte a organizarte.")
     app.run_polling()
