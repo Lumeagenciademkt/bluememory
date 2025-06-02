@@ -105,6 +105,20 @@ def buscar_citas_usuario_fecha(username, fecha_consulta=None):
                 })
     return citas
 
+def procesar_multi_linea(texto):
+    """Intenta extraer todos los campos si el usuario pega info tipo formulario."""
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+    if len(lineas) >= 6:
+        return {
+            "cliente": lineas[0],
+            "num_cliente": lineas[1],
+            "proyecto": lineas[2],
+            "modalidad": lineas[3],
+            "fecha_hora": lineas[4],
+            "observaciones": lineas[5]
+        }
+    return {}
+
 async def solicitar_dato(update, estado):
     for campo, pregunta in CAMPOS:
         if campo not in estado or not estado[campo]:
@@ -115,46 +129,31 @@ async def solicitar_dato(update, estado):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
-    username = user.username
+    username = user.username or user.first_name or "sin_usuario"
     text = update.message.text.strip()
+    
+    # RESET (por si quieres limpiar el flujo manualmente)
+    if text.lower() in ["/reset", "reset", "cancelar"]:
+        user_states[user_id] = {}
+        await update.message.reply_text("Flujo reiniciado. ¡Puedes empezar de nuevo!")
+        return
+
+    # RECOGE DATOS
     if user_id not in user_states:
         user_states[user_id] = {}
-
     estado = user_states[user_id]
 
-    # === Reportar resultado de cita ===
-    if text.lower().startswith("reporte "):
-        try:
-            _, rec_id, *detalle = text.split(" ")
-            detalle = " ".join(detalle)
-            if rec_id.isdigit():
-                row_idx = int(rec_id)
-                sheet.update_cell(row_idx, 7, detalle) # Columna G: Observaciones del recordatorio
-                await update.message.reply_text("📝 ¡Reporte/Observación guardada! Gracias.")
-            else:
-                await update.message.reply_text("ID inválido. Usa el número de fila del Sheet.")
-        except Exception:
-            await update.message.reply_text("❌ No se pudo registrar la observación. Usa: reporte <fila> <observaciones>")
-        return
+    # Si responde tipo formulario (varias líneas)
+    if len(text.split("\n")) >= 6:
+        estado.update(procesar_multi_linea(text))
+    else:
+        # Encuentra el primer campo faltante y lo completa
+        for campo, pregunta in CAMPOS:
+            if campo not in estado or not estado[campo]:
+                estado[campo] = text
+                break
 
-    # === Consulta de reuniones/citas del día ===
-    if "reuniones" in text.lower() or "citas" in text.lower() or "pendientes" in text.lower():
-        citas_hoy = buscar_citas_usuario_fecha(username)
-        if citas_hoy:
-            respuesta = "📅 Tus reuniones/citas de hoy:\n"
-            for c in citas_hoy:
-                respuesta += f"Fila {c['row']}: {c['modalidad']} con {c['cliente']} ({c['proyecto']}) a las {c['hora']} - Obs: {c['observaciones']}\n"
-            await update.message.reply_text(respuesta)
-        else:
-            await update.message.reply_text("No tienes reuniones/citas registradas hoy.")
-        return
-
-    # === Recolecta datos uno a uno ===
-    for campo, pregunta in CAMPOS:
-        if campo not in estado or not estado[campo]:
-            estado[campo] = text
-            break
-
+    # Chequea si todos los campos están completos
     completos = await solicitar_dato(update, estado)
     if not completos:
         return
@@ -167,8 +166,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fecha_hora = estado["fecha_hora"]
     observaciones = estado["observaciones"]
 
+    # Validación y formateo de fecha/hora
     try:
-        dt = dateparser.parse(fecha_hora)
+        dt = dateparser.parse(fecha_hora, dayfirst=True, fuzzy=True)
         fecha_hora_fmt = dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         await update.message.reply_text("❌ No entendí la fecha/hora. Por favor, usa formato 2025-06-02 18:00")
@@ -176,6 +176,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await solicitar_dato(update, estado)
         return
 
+    # Guarda en el sheet
     sheet.append_row([
         username,       # A: USUARIO
         fecha_hora_fmt, # B: FECHA Y HORA
