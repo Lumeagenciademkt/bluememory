@@ -9,9 +9,6 @@ from datetime import datetime, timedelta
 import pytz
 import re
 import json
-import threading
-import time
-import asyncio
 
 # --- Cargar variables de entorno ---
 load_dotenv()
@@ -162,61 +159,6 @@ def consulta_recordatorios(user_id, fecha_buscada):
             result.append(data)
     return result
 
-async def send_notification(app, user_id, text):
-    try:
-        await app.bot.send_message(chat_id=int(user_id), text=text)
-        db.collection("notificaciones").add({
-            "user_id": user_id,
-            "mensaje": text,
-            "fecha_envio": datetime.now()
-        })
-    except Exception as e:
-        print(f"[NOTIFY ERROR] {e}")
-
-def cargar_recordatorios_futuros():
-    now = datetime.now(pytz.timezone('America/Lima'))
-    docs = db.collection("recordatorios").stream()
-    futuros = []
-    for doc in docs:
-        data = doc.to_dict()
-        user_id = data.get("user_id")
-        fecha_str = data.get("fecha_hora")
-        if not (user_id and fecha_str):
-            continue
-        try:
-            fecha_dt = None
-            for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
-                try:
-                    fecha_dt = datetime.strptime(fecha_str, fmt)
-                    break
-                except: continue
-            if not fecha_dt:
-                continue
-            if fecha_dt > now:
-                futuros.append((fecha_dt, user_id, data))
-        except Exception as e:
-            continue
-    return futuros
-
-def start_scheduler(app):
-    def scheduler():
-        print("[SCHEDULER] Notificaciones activas...")
-        enviados = set()
-        while True:
-            futuros = cargar_recordatorios_futuros()
-            now = datetime.now(pytz.timezone('America/Lima'))
-            for fecha_dt, user_id, data in futuros:
-                delta = (fecha_dt - now).total_seconds()
-                clave = (user_id, data.get("fecha_hora", ""))
-                if 0 <= delta < 90 and clave not in enviados:
-                    resumen = "\n".join([f"{k.capitalize()}: {data.get(k,'')}" for k in CAMPOS])
-                    text = f"🔔 *Recordatorio programado:*\n{resumen}"
-                    asyncio.run(send_notification(app, user_id, text))
-                    enviados.add(clave)
-            time.sleep(30)
-    thread = threading.Thread(target=scheduler, daemon=True)
-    thread.start()
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
@@ -261,13 +203,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"❌ No se pudo guardar: faltan los campos {', '.join(faltan)}. Vuelve a intentarlo."
                 )
-                db.collection("logs").add({
-                    "accion": "error_guardado_incompleto",
-                    "user_id": user_id,
-                    "campos": campos,
-                    "faltan": faltan,
-                    "fecha": datetime.now()
-                })
                 user_states[user_id] = {}
                 return
             try:
@@ -277,21 +212,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     **{k: campos.get(k, "") for k in CAMPOS},
                 })
                 await update.message.reply_text("✅ Recordatorio guardado correctamente. Te avisaré aquí mismo cuando sea la fecha.")
-                db.collection("logs").add({
-                    "accion": "guardar_recordatorio",
-                    "user_id": user_id,
-                    "campos": campos,
-                    "fecha": datetime.now()
-                })
             except Exception as e:
                 await update.message.reply_text(f"❌ Ocurrió un error guardando el recordatorio: {str(e)}")
-                db.collection("logs").add({
-                    "accion": "error_guardado_firestore",
-                    "user_id": user_id,
-                    "campos": campos,
-                    "error": str(e),
-                    "fecha": datetime.now()
-                })
             user_states[user_id] = {}
             return
         elif respuesta == "no":
@@ -324,13 +246,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if campo in CAMPOS:
                 db.collection("recordatorios").document(doc.id).update({campo: valor})
                 await update.message.reply_text(f"✅ Recordatorio actualizado: {campo} = {valor}")
-                db.collection("logs").add({
-                    "accion": "editar_recordatorio",
-                    "user_id": user_id,
-                    "campo": campo,
-                    "valor": valor,
-                    "fecha": datetime.now()
-                })
             else:
                 await update.message.reply_text("Campo no válido. Solo puedes editar: " + ", ".join(CAMPOS))
         else:
@@ -403,6 +318,5 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    start_scheduler(app)
-    print("🤖 Blue listo y ahora sí, 100% confiable. Esperando mensajes.")
+    print("🤖 Blue listo y esperando mensajes.")
     app.run_polling()
