@@ -4,9 +4,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from dateutil import parser as dateparser
+import datetime
 
-# === Configuración ===
+# ===== Config Sheets =====
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
@@ -20,114 +21,107 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scop
 gc = gspread.authorize(creds)
 sheet = gc.open(SHEET_NAME).sheet1
 
-def get_crm_data():
-    headers = sheet.row_values(1)
-    rows = sheet.get_all_values()[1:]
-    data = [dict(zip(headers, row)) for row in rows if any(row)]
-    return data, headers
-
-def parse_fecha(texto):
-    """
-    Intenta extraer una fecha o rango de fechas del texto.
-    Ejemplos válidos: 'hoy', 'mañana', '2025-06-02', 'del 2025-06-01 al 2025-06-05'
-    """
-    texto = texto.lower()
-    hoy = datetime.now().date()
-    if "hoy" in texto:
-        return hoy, hoy
-    if "mañana" in texto:
-        return hoy + timedelta(days=1), hoy + timedelta(days=1)
-    # Rango
-    if "al" in texto or "hasta" in texto:
-        partes = texto.replace("al", "hasta").split("hasta")
-        try:
-            fecha_ini = datetime.strptime(partes[0].split()[-1], "%Y-%m-%d").date()
-            fecha_fin = datetime.strptime(partes[1].strip().split()[0], "%Y-%m-%d").date()
-            return fecha_ini, fecha_fin
-        except:
-            return None, None
-    # Fecha específica
-    for token in texto.replace(",", " ").split():
-        try:
-            fecha = datetime.strptime(token, "%Y-%m-%d").date()
-            return fecha, fecha
-        except:
-            continue
-    return None, None
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    crm_data, headers = get_crm_data()
-    respuesta = ""
-    today = datetime.now().date()
-
-    # ----------- CONSULTA POR FECHA (reconoce varias formas) -----------
-    if "cita" in text or "reunion" in text or "agenda" in text or "pendiente" in text:
-        fecha_ini, fecha_fin = parse_fecha(text)
-        if not fecha_ini:
-            # Si no encuentra fecha, busca por hoy
-            fecha_ini = fecha_fin = today
-
-        citas = []
-        for row in crm_data:
-            fh = row.get('FECHA Y HORA','')
+    msg = update.message.text.strip().lower()
+    rows = sheet.get_all_records()
+    
+    # Mapea nombres de columnas (en mayúsculas)
+    columnas = [c.strip().upper() for c in sheet.row_values(1)]
+    
+    # Helper para buscar citas por fecha
+    def filtrar_citas_por_fecha(fecha=None, desde=None, hasta=None):
+        resultados = []
+        for row in rows:
             try:
-                if fh:
-                    fecha_fila = datetime.strptime(fh.split()[0], "%Y-%m-%d").date()
-                    if fecha_ini <= fecha_fila <= fecha_fin:
-                        citas.append(row)
-            except: continue
-
-        if citas:
-            if fecha_ini == fecha_fin:
-                respuesta += f"📋 *Citas para {fecha_ini}:*\n"
-            else:
-                respuesta += f"📋 *Citas del {fecha_ini} al {fecha_fin}:*\n"
-            for c in citas:
-                respuesta += f"- Cliente: {c.get('CLIENTE','')} | Proyecto: {c.get('PROYECTO','')} | Hora: {c.get('FECHA Y HORA','')} | Modalidad: {c.get('MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)','')} | Obs: {c.get('OBSERVACIONES DEL RECORDATORIO','')}\n"
+                fh = row.get("FECHA Y HORA", "")
+                dt = dateparser.parse(str(fh), dayfirst=False, fuzzy=True)
+            except Exception:
+                continue
+            if fecha and dt.date() == fecha:
+                resultados.append(row)
+            elif desde and hasta and (desde <= dt.date() <= hasta):
+                resultados.append(row)
+        return resultados
+    
+    # CITAS DE HOY
+    if "citas hoy" in msg:
+        hoy = datetime.datetime.now().date()
+        resultados = filtrar_citas_por_fecha(fecha=hoy)
+        if resultados:
+            texto = "\n\n".join([
+                f"🗓 {r['FECHA Y HORA']} | Cliente: {r.get('CLIENTE','')} | Proyecto: {r.get('PROYECTO','')} | Modalidad: {r.get('MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)','')}\nObs: {r.get('OBSERVACIONES DEL RECORDATORIO','')}"
+                for r in resultados
+            ])
+            await update.message.reply_text(texto)
         else:
-            respuesta = f"No hay citas encontradas para ese rango de fechas."
-        await update.message.reply_text(respuesta, parse_mode="Markdown")
+            await update.message.reply_text("No hay citas para hoy.")
+        return
+    
+    # CITAS POR FECHA ESPECÍFICA (ej: citas 2025-06-12)
+    if "citas " in msg:
+        partes = msg.split()
+        try:
+            ix = partes.index("citas")
+            fecha_txt = partes[ix+1]
+            fecha = dateparser.parse(fecha_txt, dayfirst=False, fuzzy=True).date()
+            resultados = filtrar_citas_por_fecha(fecha=fecha)
+            if resultados:
+                texto = "\n\n".join([
+                    f"🗓 {r['FECHA Y HORA']} | Cliente: {r.get('CLIENTE','')} | Proyecto: {r.get('PROYECTO','')} | Modalidad: {r.get('MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)','')}\nObs: {r.get('OBSERVACIONES DEL RECORDATORIO','')}"
+                    for r in resultados
+                ])
+                await update.message.reply_text(texto)
+            else:
+                await update.message.reply_text("No hay citas para esa fecha.")
+            return
+        except Exception:
+            pass
+    
+    # CLIENTES
+    if "clientes" in msg:
+        clientes = [row["CLIENTE"] for row in rows if row.get("CLIENTE")]
+        texto = "Clientes registrados:\n- " + "\n- ".join(sorted(set(clientes)))
+        await update.message.reply_text(texto)
+        return
+    
+    # PROYECTOS
+    if "proyectos" in msg:
+        proyectos = [row["PROYECTO"] for row in rows if row.get("PROYECTO")]
+        texto = "Proyectos registrados:\n- " + "\n- ".join(sorted(set(proyectos)))
+        await update.message.reply_text(texto)
         return
 
-    # ----------- CONSULTA POR COLUMNA -----------
-    for header in headers:
-        if header.lower() in text:
-            col_data = [row[header] for row in crm_data if row[header]]
-            if col_data:
-                respuesta = f"Columna '{header}':\n" + "\n".join(f"- {v}" for v in col_data)
+    # BUSCAR POR CLIENTE
+    if "buscar" in msg:
+        partes = msg.split("buscar")
+        if len(partes) > 1:
+            nombre = partes[1].strip().lower()
+            resultados = [row for row in rows if nombre in str(row.get("CLIENTE","")).lower()]
+            if resultados:
+                texto = "\n\n".join([
+                    f"🗓 {r['FECHA Y HORA']} | Cliente: {r.get('CLIENTE','')} | Proyecto: {r.get('PROYECTO','')} | Modalidad: {r.get('MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)','')}\nObs: {r.get('OBSERVACIONES DEL RECORDATORIO','')}"
+                    for r in resultados
+                ])
+                await update.message.reply_text(texto)
             else:
-                respuesta = f"No hay datos en la columna '{header}'."
-            await update.message.reply_text(respuesta)
+                await update.message.reply_text("No hay citas con ese cliente.")
             return
 
-    # ----------- BUSCAR CLIENTE POR NOMBRE -----------
-    if "buscar" in text:
-        nombre = text.split("buscar",1)[-1].strip()
-        resultados = [row for row in crm_data if nombre.lower() in row.get('CLIENTE','').lower()]
-        if resultados:
-            respuesta = f"Resultados para '{nombre}':\n"
-            for c in resultados:
-                respuesta += f"- Cliente: {c.get('CLIENTE','')} | Proyecto: {c.get('PROYECTO','')} | Hora: {c.get('FECHA Y HORA','')} | Modalidad: {c.get('MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)','')} | Obs: {c.get('OBSERVACIONES DEL RECORDATORIO','')}\n"
-        else:
-            respuesta = f"No encontré clientes llamados '{nombre}'."
-        await update.message.reply_text(respuesta)
-        return
+    # Si pregunta por columnas específicas
+    for col in columnas:
+        if col.lower() in msg:
+            valores = [str(row.get(col,"")) for row in rows if row.get(col)]
+            await update.message.reply_text(f"Columna '{col}':\n- " + "\n- ".join(valores))
+            return
 
-    # ----------- AYUDA GENERAL -----------
+    # AYUDA BÁSICA
     await update.message.reply_text(
-        "Soy tu asistente CRM (con Google Sheets como base de datos). "
-        "Puedes pedirme, por ejemplo:\n"
-        "- citas hoy\n"
-        "- citas 2025-06-12\n"
-        "- citas del 2025-06-01 al 2025-06-05\n"
-        "- buscar juan\n"
-        "- clientes\n"
-        "- proyectos"
+        "Soy tu asistente CRM (Google Sheets base de datos).\nPuedes pedirme, por ejemplo:\n"
+        "- citas hoy\n- citas 2025-06-12\n- buscar <nombre>\n- clientes\n- proyectos"
     )
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Bot CRM Sheets listo y corriendo.")
+    print("🤖 Bot CRM solo lectura listo.")
     app.run_polling()
