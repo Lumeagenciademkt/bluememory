@@ -3,4 +3,6 @@ openai==1.23.2
 google-cloud-firestore==2.16.0
 python-dotenv==1.0.1
 python-dateutil==2.9.0.post0
+firebase-admin==6.5.0
+
 
