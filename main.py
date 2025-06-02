@@ -16,7 +16,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# Configura el cliente OpenAI al nuevo estilo
+# Configura el cliente OpenAI
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # ===== Firebase config =====
@@ -94,6 +94,7 @@ def buscar_citas_usuario_fecha(user_id, fecha_consulta=None):
     return citas
 
 async def solicitar_dato(update, estado):
+    # Devuelve True si ya están todos los campos completos
     for campo, pregunta in CAMPOS:
         if campo not in estado or not estado[campo]:
             await update.message.reply_text(pregunta)
@@ -102,7 +103,7 @@ async def solicitar_dato(update, estado):
 
 def gpt_extract_fields(mensaje):
     prompt = f"""
-Eres un asistente para agendas empresariales. Dado el siguiente mensaje de un usuario, extrae estos campos:
+Eres un asistente de agendas empresariales. Extrae de este mensaje los siguientes campos en formato JSON:
 - cliente
 - num_cliente
 - proyecto
@@ -110,10 +111,18 @@ Eres un asistente para agendas empresariales. Dado el siguiente mensaje de un us
 - fecha_hora
 - observaciones
 
-Si un campo no está presente, escribe "FALTA".
+Si un campo no está presente, responde "FALTA".
 
 Mensaje: \"{mensaje}\"
-Responde solo con un JSON.
+Ejemplo de respuesta:
+{{
+  "cliente": "Juan Perez",
+  "num_cliente": "12345678",
+  "proyecto": "Proyecto X",
+  "modalidad": "virtual",
+  "fecha_hora": "2025-06-02 18:00",
+  "observaciones": "FALTA"
+}}
 """
     respuesta = openai_client.chat.completions.create(
         model="gpt-4o",
@@ -158,76 +167,93 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No tienes reuniones/citas registradas hoy.")
         return
 
-    # === Flujo inteligente con GPT-4 ===
-    # Si no estamos completando un campo pendiente, extraemos lo que podamos del mensaje:
-    if not estado or not any(estado.values()):
-        fields = gpt_extract_fields(text)
-        for campo, _ in CAMPOS:
-            if fields.get(campo) and fields[campo] != "FALTA":
-                estado[campo] = fields[campo]
-            else:
-                estado.setdefault(campo, "")
-
-    # === Recolecta datos uno a uno ===
+    # ============= FLUJO PRINCIPAL: INTELIGENCIA DE AGENDA O CHAT ===========
+    # Primero: si el usuario está llenando un campo, sigue el flujo ordenado
+    faltante = None
     for campo, pregunta in CAMPOS:
-        if not estado[campo]:
-            estado[campo] = text
+        if campo not in estado or not estado[campo]:
+            faltante = campo
             break
 
-    completos = await solicitar_dato(update, estado)
-    if not completos:
-        return
+    if faltante:
+        # Si recién comienza o está llenando campo por campo
+        if not any(estado.values()):
+            # Extraer automáticamente los campos si el mensaje es largo (ej: todos los datos en 1 solo mensaje)
+            fields = gpt_extract_fields(text)
+            for campo, _ in CAMPOS:
+                if fields.get(campo) and fields[campo] != "FALTA":
+                    estado[campo] = fields[campo]
+                else:
+                    estado.setdefault(campo, "")
+        else:
+            # El usuario está completando un campo específico, guarda lo que acaba de responder
+            estado[faltante] = text
 
-    # Procesa el registro completo:
-    cliente = estado["cliente"]
-    num_cliente = estado["num_cliente"]
-    proyecto = estado["proyecto"]
-    modalidad = estado["modalidad"]
-    fecha_hora = estado["fecha_hora"]
-    observaciones = estado["observaciones"]
+        # Si todavía falta algo, pregúntalo en orden
+        completos = await solicitar_dato(update, estado)
+        if not completos:
+            return
 
-    try:
-        dt = dateparser.parse(fecha_hora)
-        fecha_hora_fmt = dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        await update.message.reply_text("❌ No entendí la fecha/hora. Por favor, usa formato 2025-06-02 18:00")
-        estado["fecha_hora"] = ""
-        await solicitar_dato(update, estado)
-        return
+    else:
+        # Si ya tiene todo, agenda y limpia estado
+        cliente = estado["cliente"]
+        num_cliente = estado["num_cliente"]
+        proyecto = estado["proyecto"]
+        modalidad = estado["modalidad"]
+        fecha_hora = estado["fecha_hora"]
+        observaciones = estado["observaciones"]
 
-    db.collection("citas").add({
-        "user_id": user_id,
-        "usuario": user.full_name,
-        "fecha_hora": fecha_hora_fmt,
-        "cliente": cliente,
-        "num_cliente": num_cliente,
-        "proyecto": proyecto,
-        "modalidad": modalidad,
-        "observaciones": observaciones
-    })
-    await update.message.reply_text(
-        f"✅ ¡Cita registrada para {cliente} ({modalidad}) el {fecha_hora_fmt}!\n"
-        f"Proyecto: {proyecto}\n"
-        f"Número de cliente: {num_cliente}\n"
-        f"Observaciones: {observaciones}\n"
-        "Recibirás recordatorios automáticos antes de la cita."
-    )
+        try:
+            dt = dateparser.parse(fecha_hora)
+            fecha_hora_fmt = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            await update.message.reply_text("❌ No entendí la fecha/hora. Por favor, usa formato 2025-06-02 18:00")
+            estado["fecha_hora"] = ""
+            await solicitar_dato(update, estado)
+            return
 
-    # Agrega recordatorio automático
-    try:
-        reminders.append({
-            "id": len(reminders)+2,
-            "chat_id": update.effective_chat.id,
+        db.collection("citas").add({
+            "user_id": user_id,
+            "usuario": user.full_name,
+            "fecha_hora": fecha_hora_fmt,
             "cliente": cliente,
-            "modalidad": modalidad,
+            "num_cliente": num_cliente,
             "proyecto": proyecto,
-            "datetime": dt,
+            "modalidad": modalidad,
+            "observaciones": observaciones
         })
-    except Exception as e:
-        print("No se pudo programar recordatorio automático:", e)
+        await update.message.reply_text(
+            f"✅ ¡Cita registrada para {cliente} ({modalidad}) el {fecha_hora_fmt}!\n"
+            f"Proyecto: {proyecto}\n"
+            f"Número de cliente: {num_cliente}\n"
+            f"Observaciones: {observaciones}\n"
+            "Recibirás recordatorios automáticos antes de la cita."
+        )
+        # Agrega recordatorio automático
+        try:
+            reminders.append({
+                "id": len(reminders)+2,
+                "chat_id": update.effective_chat.id,
+                "cliente": cliente,
+                "modalidad": modalidad,
+                "proyecto": proyecto,
+                "datetime": dt,
+            })
+        except Exception as e:
+            print("No se pudo programar recordatorio automático:", e)
+        user_states[user_id] = {}
+        update_memory(user_id, text, f"Registro completado para {cliente}")
+        return
 
-    user_states[user_id] = {}
-    update_memory(user_id, text, f"Registro completado para {cliente}")
+    # === FLUJO SECUNDARIO: CHAT NORMAL GPT ===
+    # Si no estamos llenando una agenda, responde casual
+    if not any(estado.values()) and not faltante:
+        respuesta = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": text}]
+        )
+        await update.message.reply_text(respuesta.choices[0].message.content)
+        return
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -236,5 +262,3 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     loop.create_task(reminder_job(app))
     app.run_polling()
-
-
