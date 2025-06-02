@@ -9,6 +9,9 @@ from datetime import datetime, timedelta
 import pytz
 import re
 import json
+import threading
+import time
+import asyncio
 
 # --- Cargar variables de entorno ---
 load_dotenv()
@@ -44,7 +47,6 @@ def plantilla_recordatorio():
         "Ejemplo: Juan Pérez, 98798798, Proyecto Malabrigo, presencial, 6 de junio 3pm, venta de lote, obs: revisar contrato"
     )
 
-# --- Normaliza fechas humanas a formato ISO (YYYY-MM-DD HH:MM) ---
 def normaliza_fecha(texto):
     texto = texto.lower().strip()
     tz = pytz.timezone('America/Lima')
@@ -90,7 +92,6 @@ def normaliza_fecha(texto):
         return now.strftime("%Y-%m-%d ") + f"{hora:02d}:00"
     return texto
 
-# --- GPT Extraction mejorada ---
 def gpt_parse_recordatorio(texto_usuario):
     prompt = f"""
 Eres un asistente para organizar agendas empresariales. Un usuario te dará varios datos sobre un recordatorio, en frases, líneas, bullets o cualquier orden. Interpreta y extrae los campos, aunque estén separados por saltos de línea.
@@ -103,6 +104,8 @@ Devuelve SOLO un JSON válido con estos campos:
 - fecha_hora
 - motivo
 - observaciones
+
+Si algún dato no lo encuentras, deja el campo vacío "".
 
 Ejemplo de entrada válida:
 '''
@@ -138,17 +141,16 @@ Responde SOLO con el JSON.
     try:
         campos = json.loads(content)
     except Exception:
-        # Limpiar si viene con markdown o saltos
         content = content.replace("\n", "").replace("```json", "").replace("```", "")
         try:
             campos = json.loads(content)
         except Exception:
             campos = {}
-    # Asegúrate de que todos los campos estén presentes (aunque sean vacíos)
-    return {k: campos.get(k, "") for k in CAMPOS}
+    # Siempre devuelve todos los campos
+    return {k: str(campos.get(k, "") or "") for k in CAMPOS}
 
 def campos_faltantes(campos):
-    return [c for c in CAMPOS if not campos.get(c)]
+    return [c for c in CAMPOS if not (campos.get(c) and str(campos.get(c)).strip())]
 
 def consulta_recordatorios(user_id, fecha_buscada):
     docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
@@ -160,15 +162,69 @@ def consulta_recordatorios(user_id, fecha_buscada):
             result.append(data)
     return result
 
+async def send_notification(app, user_id, text):
+    try:
+        await app.bot.send_message(chat_id=int(user_id), text=text)
+        db.collection("notificaciones").add({
+            "user_id": user_id,
+            "mensaje": text,
+            "fecha_envio": datetime.now()
+        })
+    except Exception as e:
+        print(f"[NOTIFY ERROR] {e}")
+
+def cargar_recordatorios_futuros():
+    now = datetime.now(pytz.timezone('America/Lima'))
+    docs = db.collection("recordatorios").stream()
+    futuros = []
+    for doc in docs:
+        data = doc.to_dict()
+        user_id = data.get("user_id")
+        fecha_str = data.get("fecha_hora")
+        if not (user_id and fecha_str):
+            continue
+        try:
+            fecha_dt = None
+            for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
+                try:
+                    fecha_dt = datetime.strptime(fecha_str, fmt)
+                    break
+                except: continue
+            if not fecha_dt:
+                continue
+            if fecha_dt > now:
+                futuros.append((fecha_dt, user_id, data))
+        except Exception as e:
+            continue
+    return futuros
+
+def start_scheduler(app):
+    def scheduler():
+        print("[SCHEDULER] Notificaciones activas...")
+        enviados = set()
+        while True:
+            futuros = cargar_recordatorios_futuros()
+            now = datetime.now(pytz.timezone('America/Lima'))
+            for fecha_dt, user_id, data in futuros:
+                delta = (fecha_dt - now).total_seconds()
+                clave = (user_id, data.get("fecha_hora", ""))
+                if 0 <= delta < 90 and clave not in enviados:
+                    resumen = "\n".join([f"{k.capitalize()}: {data.get(k,'')}" for k in CAMPOS])
+                    text = f"🔔 *Recordatorio programado:*\n{resumen}"
+                    asyncio.run(send_notification(app, user_id, text))
+                    enviados.add(clave)
+            time.sleep(30)
+    thread = threading.Thread(target=scheduler, daemon=True)
+    thread.start()
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
     text = update.message.text.strip()
-    user_name = user.username or getattr(user, "full_name", "") or "usuario"
+    user_name = getattr(user, "username", None) or getattr(user, "full_name", None) or "usuario"
     tz = pytz.timezone('America/Lima')
     now = datetime.now(tz)
 
-    # --- 1. Estado: ¿está llenando recordatorio? ---
     estado = user_states.get(user_id, {})
     if estado.get("en_recordatorio"):
         last_campos = estado.get("campos", {})
@@ -192,15 +248,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         estado["campos"] = last_campos
         estado["confirmar"] = True
-        estado["en_recordatorio"] = False  # <- Corta modo edición
+        estado["en_recordatorio"] = False
         user_states[user_id] = estado
         return
 
-    # --- 2. Confirmación de guardado (FLUJO FIJO) ---
     if estado.get("confirmar"):
         respuesta = text.strip().lower()
         if respuesta in ["sí", "si"]:
             campos = estado.get("campos", {})
+            faltan = campos_faltantes(campos)
+            if faltan:
+                await update.message.reply_text(
+                    f"❌ No se pudo guardar: faltan los campos {', '.join(faltan)}. Vuelve a intentarlo."
+                )
+                db.collection("logs").add({
+                    "accion": "error_guardado_incompleto",
+                    "user_id": user_id,
+                    "campos": campos,
+                    "faltan": faltan,
+                    "fecha": datetime.now()
+                })
+                user_states[user_id] = {}
+                return
             try:
                 db.collection("recordatorios").add({
                     "user_id": user_id,
@@ -208,25 +277,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     **{k: campos.get(k, "") for k in CAMPOS},
                 })
                 await update.message.reply_text("✅ Recordatorio guardado correctamente. Te avisaré aquí mismo cuando sea la fecha.")
+                db.collection("logs").add({
+                    "accion": "guardar_recordatorio",
+                    "user_id": user_id,
+                    "campos": campos,
+                    "fecha": datetime.now()
+                })
             except Exception as e:
                 await update.message.reply_text(f"❌ Ocurrió un error guardando el recordatorio: {str(e)}")
-            user_states[user_id] = {}  # LIMPIA estado SIEMPRE
+                db.collection("logs").add({
+                    "accion": "error_guardado_firestore",
+                    "user_id": user_id,
+                    "campos": campos,
+                    "error": str(e),
+                    "fecha": datetime.now()
+                })
+            user_states[user_id] = {}
             return
         elif respuesta == "no":
             await update.message.reply_text("Registro cancelado. Si quieres crear otro recordatorio, solo dímelo.")
-            user_states[user_id] = {}  # LIMPIA estado
+            user_states[user_id] = {}
             return
         else:
             await update.message.reply_text("Por favor, responde SÍ para guardar o NO para cancelar.")
             return
 
-    # --- 3. Nueva solicitud de recordatorio ---
+    m = re.match(r"editar recordatorio\s+([\d/:-\s]+):?\s*(.+)?", text.lower())
+    if m:
+        fecha_raw = m.group(1).strip()
+        nuevo_campo_valor = m.group(2) or ""
+        user_recs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
+        fecha_norm = normaliza_fecha(fecha_raw)
+        found = None
+        for doc in user_recs:
+            data = doc.to_dict()
+            if fecha_norm in data.get("fecha_hora", ""):
+                found = (doc, data)
+                break
+        if not found:
+            await update.message.reply_text("No encontré ningún recordatorio con esa fecha/hora.")
+            return
+        doc, data = found
+        m2 = re.match(r"(\w+):\s*(.+)", nuevo_campo_valor)
+        if m2:
+            campo, valor = m2.group(1).strip(), m2.group(2).strip()
+            if campo in CAMPOS:
+                db.collection("recordatorios").document(doc.id).update({campo: valor})
+                await update.message.reply_text(f"✅ Recordatorio actualizado: {campo} = {valor}")
+                db.collection("logs").add({
+                    "accion": "editar_recordatorio",
+                    "user_id": user_id,
+                    "campo": campo,
+                    "valor": valor,
+                    "fecha": datetime.now()
+                })
+            else:
+                await update.message.reply_text("Campo no válido. Solo puedes editar: " + ", ".join(CAMPOS))
+        else:
+            await update.message.reply_text("Formato inválido. Ejemplo de uso:\nEditar recordatorio 12/06/2025 16:00: motivo: Cierre de venta")
+        return
+
     if any(x in text.lower() for x in ["agenda", "recordar", "cita", "reunión", "recordatorio"]):
         await update.message.reply_text(plantilla_recordatorio())
         user_states[user_id] = {"en_recordatorio": True, "campos": {}}
         return
 
-    # --- 4. Consulta de recordatorios por fecha ---
     if any(x in text.lower() for x in ["qué recordatorio", "qué tengo", "pendiente", "reunión"]) or re.search(r'\d{1,2} de \w+|\d{4}-\d{2}-\d{2}', text):
         fecha_buscada = None
         m1 = re.search(r'(\d{1,2})\s*de\s*(\w+)', text.lower())
@@ -256,7 +371,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No tienes recordatorios para esa fecha.")
         return
 
-    # --- 5. Chat IA normal ---
     system_prompt = (
         "Eres Blue, un asistente personal de productividad en Telegram. "
         "Tu función principal es ayudar a organizar, agendar recordatorios y citas, y responder cualquier duda de forma amigable. "
@@ -275,8 +389,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         gpt_reply = f"Lo siento, ocurrió un error procesando tu consulta: {str(e)}"
     await update.message.reply_text(gpt_reply)
-
-    # Guarda chat en firestore
     try:
         db.collection("chats").add({
             "user_id": user_id,
@@ -286,11 +398,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "fecha": datetime.now()
         })
     except:
-        pass  # Si falla el log, no afecta UX
+        pass
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Blue listo, con extracción flexible y confirmación robusta de recordatorios.")
+    start_scheduler(app)
+    print("🤖 Blue listo y ahora sí, 100% confiable. Esperando mensajes.")
     app.run_polling()
-
