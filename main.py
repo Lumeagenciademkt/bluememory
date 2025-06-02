@@ -44,6 +44,7 @@ def plantilla_recordatorio():
         "Ejemplo: Juan Pérez, 98798798, Proyecto Malabrigo, presencial, 6 de junio 3pm, venta de lote, obs: revisar contrato"
     )
 
+# --- Normaliza fechas humanas a formato ISO (YYYY-MM-DD HH:MM) ---
 def normaliza_fecha(texto):
     texto = texto.lower().strip()
     tz = pytz.timezone('America/Lima')
@@ -53,6 +54,7 @@ def normaliza_fecha(texto):
         texto = texto.replace("mañana", base.strftime("%Y-%m-%d"))
     if "hoy" in texto:
         texto = texto.replace("hoy", now.strftime("%Y-%m-%d"))
+    # Detecta fechas tipo 6 de junio 3pm
     meses = {
         "enero":"01", "febrero":"02", "marzo":"03", "abril":"04", "mayo":"05", "junio":"06",
         "julio":"07", "agosto":"08", "septiembre":"09", "octubre":"10", "noviembre":"11", "diciembre":"12"
@@ -76,19 +78,22 @@ def normaliza_fecha(texto):
             else:
                 hora = f"{int(hora):02d}:00"
             return f"{año}-{mes_num}-{int(dia):02d} {hora}"
+    # Busca YYYY-MM-DD HH:MM o DD/MM/YYYY HH:MM
     for fmt in ["%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"]:
         try:
             fecha = datetime.strptime(texto, fmt)
             return fecha.strftime("%Y-%m-%d %H:%M")
         except: continue
+    # Si solo hora: "3pm"
     m = re.match(r'(\d{1,2})(am|pm)', texto)
     if m:
         hora = int(m.group(1))
         if m.group(2) == 'pm' and hora < 12: hora += 12
         if m.group(2) == 'am' and hora == 12: hora = 0
         return now.strftime("%Y-%m-%d ") + f"{hora:02d}:00"
-    return texto
+    return texto  # si falla, devuelve igual
 
+# --- GPT Extraction mejorada ---
 def gpt_parse_recordatorio(texto_usuario):
     prompt = f"""
 Eres un asistente para organizar agendas empresariales. Un usuario te dará varios datos sobre un recordatorio, en frases, líneas, bullets o cualquier orden. Interpreta y extrae los campos, aunque estén separados por saltos de línea.
@@ -101,8 +106,6 @@ Devuelve SOLO un JSON válido con estos campos:
 - fecha_hora
 - motivo
 - observaciones
-
-Si algún dato no lo encuentras, deja el campo vacío "".
 
 Ejemplo de entrada válida:
 '''
@@ -131,24 +134,27 @@ Responde SOLO con el JSON.
 """
     resp = openai.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=300
+        messages=[{"role": "user", "content": prompt}]
     )
     content = resp.choices[0].message.content
     try:
         campos = json.loads(content)
     except Exception:
-        content = content.replace("\n", "").replace("```json", "").replace("```", "")
+        # Limpiar si viene con markdown o saltos
+        content = content.replace("\n", "").replace("
+json", "").replace("
+", "")
         try:
             campos = json.loads(content)
         except Exception:
             campos = {}
-    # Siempre devuelve todos los campos
-    return {k: str(campos.get(k, "") or "") for k in CAMPOS}
+    return campos
 
+# --- Chequea campos faltantes ---
 def campos_faltantes(campos):
-    return [c for c in CAMPOS if not (campos.get(c) and str(campos.get(c)).strip())]
+    return [c for c in CAMPOS if not campos.get(c)]
 
+# --- Consulta por fecha (YYYY-MM-DD) ---
 def consulta_recordatorios(user_id, fecha_buscada):
     docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
     result = []
@@ -159,111 +165,77 @@ def consulta_recordatorios(user_id, fecha_buscada):
             result.append(data)
     return result
 
+# --- Handler principal ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
     text = update.message.text.strip()
-    user_name = getattr(user, "username", None) or getattr(user, "full_name", None) or "usuario"
+    user_name = user.username or user.full_name or "usuario"
     tz = pytz.timezone('America/Lima')
     now = datetime.now(tz)
 
+    # 1. Estado: ¿está llenando recordatorio?
     estado = user_states.get(user_id, {})
     if estado.get("en_recordatorio"):
+        # Espera todos los campos juntos (o los que faltan)
         last_campos = estado.get("campos", {})
         nuevos = gpt_parse_recordatorio(text)
+        # Actualiza campos ya llenados
         for k in CAMPOS:
-            if nuevos.get(k) and nuevos.get(k).lower() != "falta":
+            if nuevos.get(k) and nuevos.get(k) != "FALTA":
                 last_campos[k] = nuevos[k]
+        # Normaliza fecha si ya está
         if last_campos.get("fecha_hora"):
             last_campos["fecha_hora"] = normaliza_fecha(last_campos["fecha_hora"])
         faltan = campos_faltantes(last_campos)
         if faltan:
+            # Pide solo lo que falta
             await update.message.reply_text(
                 f"Faltan estos campos: {', '.join(faltan)}.\nResponde solo los que faltan, en cualquier orden."
             )
             estado["campos"] = last_campos
             user_states[user_id] = estado
             return
+        # TODO: verificación visual (opcional)
         resumen = "\n".join([f"{k.capitalize()}: {last_campos[k]}" for k in CAMPOS])
-        await update.message.reply_text(
-            f"¡Perfecto! ¿Confirma guardar este recordatorio?\n\n{resumen}\n\nResponde SÍ para guardar o NO para cancelar."
-        )
+        await update.message.reply_text(f"¡Perfecto! ¿Confirmas guardar este recordatorio?\n\n{resumen}\n\nResponde SÍ para guardar o NO para cancelar.")
         estado["campos"] = last_campos
         estado["confirmar"] = True
-        estado["en_recordatorio"] = False
         user_states[user_id] = estado
         return
 
     if estado.get("confirmar"):
-        respuesta = text.strip().lower()
-        if respuesta in ["sí", "si"]:
+        # Esperando confirmación del usuario
+        if text.strip().lower() == "sí":
             campos = estado.get("campos", {})
-            faltan = campos_faltantes(campos)
-            if faltan:
-                await update.message.reply_text(
-                    f"❌ No se pudo guardar: faltan los campos {', '.join(faltan)}. Vuelve a intentarlo."
-                )
-                user_states[user_id] = {}
-                return
-            try:
-                db.collection("recordatorios").add({
-                    "user_id": user_id,
-                    "usuario": user_name,
-                    **{k: campos.get(k, "") for k in CAMPOS},
-                })
-                await update.message.reply_text("✅ Recordatorio guardado correctamente. Te avisaré aquí mismo cuando sea la fecha.")
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ocurrió un error guardando el recordatorio: {str(e)}")
+            db.collection("recordatorios").add({
+                "user_id": user_id,
+                "usuario": user_name,
+                **{k: campos.get(k, "") for k in CAMPOS},
+            })
+            await update.message.reply_text("✅ Recordatorio guardado. Te avisaré aquí mismo cuando sea la fecha.")
             user_states[user_id] = {}
-            return
-        elif respuesta == "no":
+        else:
             await update.message.reply_text("Registro cancelado. Si quieres crear otro recordatorio, solo dímelo.")
             user_states[user_id] = {}
-            return
-        else:
-            await update.message.reply_text("Por favor, responde SÍ para guardar o NO para cancelar.")
-            return
-
-    m = re.match(r"editar recordatorio\s+([\d/:-\s]+):?\s*(.+)?", text.lower())
-    if m:
-        fecha_raw = m.group(1).strip()
-        nuevo_campo_valor = m.group(2) or ""
-        user_recs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
-        fecha_norm = normaliza_fecha(fecha_raw)
-        found = None
-        for doc in user_recs:
-            data = doc.to_dict()
-            if fecha_norm in data.get("fecha_hora", ""):
-                found = (doc, data)
-                break
-        if not found:
-            await update.message.reply_text("No encontré ningún recordatorio con esa fecha/hora.")
-            return
-        doc, data = found
-        m2 = re.match(r"(\w+):\s*(.+)", nuevo_campo_valor)
-        if m2:
-            campo, valor = m2.group(1).strip(), m2.group(2).strip()
-            if campo in CAMPOS:
-                db.collection("recordatorios").document(doc.id).update({campo: valor})
-                await update.message.reply_text(f"✅ Recordatorio actualizado: {campo} = {valor}")
-            else:
-                await update.message.reply_text("Campo no válido. Solo puedes editar: " + ", ".join(CAMPOS))
-        else:
-            await update.message.reply_text("Formato inválido. Ejemplo de uso:\nEditar recordatorio 12/06/2025 16:00: motivo: Cierre de venta")
         return
 
+    # 2. Nueva solicitud de recordatorio
     if any(x in text.lower() for x in ["agenda", "recordar", "cita", "reunión", "recordatorio"]):
         await update.message.reply_text(plantilla_recordatorio())
         user_states[user_id] = {"en_recordatorio": True, "campos": {}}
         return
 
+    # 3. Consulta de recordatorios por fecha (natural o ISO)
     if any(x in text.lower() for x in ["qué recordatorio", "qué tengo", "pendiente", "reunión"]) or re.search(r'\d{1,2} de \w+|\d{4}-\d{2}-\d{2}', text):
+        # Intentar extraer fecha
         fecha_buscada = None
         m1 = re.search(r'(\d{1,2})\s*de\s*(\w+)', text.lower())
         m2 = re.search(r'(\d{4}-\d{2}-\d{2})', text)
         if m2:
             fecha_buscada = m2.group(1)
         elif m1:
+            # Convierte a ISO
             meses = {
                 "enero":"01", "febrero":"02", "marzo":"03", "abril":"04", "mayo":"05", "junio":"06",
                 "julio":"07", "agosto":"08", "septiembre":"09", "octubre":"10", "noviembre":"11", "diciembre":"12"
@@ -286,37 +258,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No tienes recordatorios para esa fecha.")
         return
 
+    # 4. Chat normal IA
     system_prompt = (
         "Eres Blue, un asistente personal de productividad en Telegram. "
         "Tu función principal es ayudar a organizar, agendar recordatorios y citas, y responder cualquier duda de forma amigable. "
         "Si la consulta es de organización o gestión, ofrece ayuda proactiva; si es general, responde como un chatbot útil."
     )
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=300
-        )
-        gpt_reply = response.choices[0].message.content.strip()
-    except Exception as e:
-        gpt_reply = f"Lo siento, ocurrió un error procesando tu consulta: {str(e)}"
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ]
+    )
+    gpt_reply = response.choices[0].message.content.strip()
     await update.message.reply_text(gpt_reply)
-    try:
-        db.collection("chats").add({
-            "user_id": user_id,
-            "user_name": user_name,
-            "mensaje": text,
-            "respuesta": gpt_reply,
-            "fecha": datetime.now()
-        })
-    except:
-        pass
+
+    # Guarda chat en firestore
+    db.collection("chats").add({
+        "user_id": user_id,
+        "user_name": user_name,
+        "mensaje": text,
+        "respuesta": gpt_reply,
+        "fecha": datetime.now()
+    })
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Blue listo y esperando mensajes.")
+    print("🤖 Blue listo, con extracción flexible y confirmación de recordatorios.")
     app.run_polling()
+
