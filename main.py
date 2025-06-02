@@ -11,6 +11,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 openai.api_key = OPENAI_API_KEY
 
@@ -19,8 +20,7 @@ scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
 ]
-# Usar la ruta donde Render monta tu secret file:
-creds = ServiceAccountCredentials.from_json_keyfile_name('/etc/secrets/credentials.json', scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scope)
 gc = gspread.authorize(creds)
 sheet = gc.open(SHEET_NAME).sheet1  # Usa la primera hoja
 
@@ -32,13 +32,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Pregunta a OpenAI
     response = openai.chat.completions.create(
         model="gpt-4-turbo",
-        messages=[{"role": "system", "content": "Eres un asistente experto en productividad y CRM. Resume y extrae los datos clave como nombre del cliente, fecha, hora, motivo, etc, de manera estructurada para Google Sheets. Si no hay información, solo responde normalmente."},
-                  {"role": "user", "content": text}]
+        messages=[
+            {"role": "system", "content": "Eres un asistente experto en productividad y CRM. Resume y extrae los datos clave como nombre del cliente, fecha, hora, motivo, etc, de manera estructurada para Google Sheets. Si no hay información, solo responde normalmente."},
+            {"role": "user", "content": text}
+        ]
     )
     gpt_answer = response.choices[0].message.content.strip()
     await update.message.reply_text(gpt_answer)
 
-    # Guarda el mensaje y la respuesta en Sheets (puedes extraer más campos si quieres)
+    # Guarda el mensaje y la respuesta en Sheets
     sheet.append_row([user.username, text, gpt_answer])
 
 if __name__ == '__main__':
@@ -46,4 +48,3 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🤖 Bot Lume listo y corriendo.")
     app.run_polling()
-
