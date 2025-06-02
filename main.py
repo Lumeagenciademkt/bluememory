@@ -1,5 +1,7 @@
 import os
 import openai
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -7,19 +9,23 @@ import datetime
 import asyncio
 from dateutil import parser as dateparser
 
-from google.cloud import firestore
-
 # ===== Cargar variables de entorno =====
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 openai.api_key = OPENAI_API_KEY
 
-# ===== Firestore config =====
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDS_JSON
-db = firestore.Client()
+# ===== Google Sheets config =====
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scope)
+gc = gspread.authorize(creds)
+sheet = gc.open(SHEET_NAME).sheet1
 
 # Estado temporal para cada usuario
 user_states = {}
@@ -70,7 +76,7 @@ async def reminder_job(application):
                     if not r.get("reportado"):
                         await application.bot.send_message(
                             chat_id=r["chat_id"],
-                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['doc_id']} <observaciones>"
+                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['row']} <observaciones>"
                         )
                         r["reportado"] = True
             await asyncio.sleep(60)
@@ -79,24 +85,23 @@ async def reminder_job(application):
             await asyncio.sleep(60)
 
 def buscar_citas_usuario_fecha(username, fecha_consulta=None):
+    rows = sheet.get_all_records()
     hoy = fecha_consulta or datetime.datetime.now().strftime("%Y-%m-%d")
     citas = []
-    docs = db.collection("citas").where("usuario", "==", username).stream()
-    for doc in docs:
-        row = doc.to_dict()
-        if "fecha_hora" in row:
+    for idx, row in enumerate(rows, 2):
+        if (row.get("USUARIO") == username and row.get("FECHA Y HORA")):
             try:
-                fecha_row = dateparser.parse(str(row["fecha_hora"]), dayfirst=False).strftime("%Y-%m-%d")
+                fecha_row = dateparser.parse(str(row["FECHA Y HORA"]), dayfirst=False).strftime("%Y-%m-%d")
             except Exception:
-                fecha_row = row["fecha_hora"]
+                fecha_row = row["FECHA Y HORA"]
             if fecha_row == hoy:
                 citas.append({
-                    "doc_id": doc.id,
-                    "cliente": row.get("cliente", ""),
-                    "modalidad": row.get("modalidad", ""),
-                    "hora": dateparser.parse(str(row["fecha_hora"])).strftime("%H:%M") if row.get("fecha_hora") else "",
-                    "proyecto": row.get("proyecto", ""),
-                    "observaciones": row.get("observaciones", "")
+                    "row": idx,
+                    "cliente": row.get("CLIENTE", ""),
+                    "modalidad": row.get("MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)", ""),
+                    "hora": dateparser.parse(str(row["FECHA Y HORA"])).strftime("%H:%M") if row.get("FECHA Y HORA") else "",
+                    "proyecto": row.get("PROYECTO", ""),
+                    "observaciones": row.get("OBSERVACIONES DEL RECORDATORIO", "")
                 })
     return citas
 
@@ -120,15 +125,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Reportar resultado de cita ===
     if text.lower().startswith("reporte "):
         try:
-            _, doc_id, *detalle = text.split(" ")
+            _, rec_id, *detalle = text.split(" ")
             detalle = " ".join(detalle)
-            if doc_id:
-                db.collection("citas").document(doc_id).update({"observaciones": detalle})
+            if rec_id.isdigit():
+                row_idx = int(rec_id)
+                sheet.update_cell(row_idx, 7, detalle) # Columna G: Observaciones del recordatorio
                 await update.message.reply_text("📝 ¡Reporte/Observación guardada! Gracias.")
             else:
-                await update.message.reply_text("ID inválido. Usa el ID del recordatorio.")
+                await update.message.reply_text("ID inválido. Usa el número de fila del Sheet.")
         except Exception:
-            await update.message.reply_text("❌ No se pudo registrar la observación. Usa: reporte <ID> <observaciones>")
+            await update.message.reply_text("❌ No se pudo registrar la observación. Usa: reporte <fila> <observaciones>")
         return
 
     # === Consulta de reuniones/citas del día ===
@@ -137,7 +143,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if citas_hoy:
             respuesta = "📅 Tus reuniones/citas de hoy:\n"
             for c in citas_hoy:
-                respuesta += f"ID {c['doc_id']}: {c['modalidad']} con {c['cliente']} ({c['proyecto']}) a las {c['hora']} - Obs: {c['observaciones']}\n"
+                respuesta += f"Fila {c['row']}: {c['modalidad']} con {c['cliente']} ({c['proyecto']}) a las {c['hora']} - Obs: {c['observaciones']}\n"
             await update.message.reply_text(respuesta)
         else:
             await update.message.reply_text("No tienes reuniones/citas registradas hoy.")
@@ -170,18 +176,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await solicitar_dato(update, estado)
         return
 
-    # Guarda en Firestore
-    doc_ref = db.collection("citas").document()
-    doc_ref.set({
-        "usuario": username,
-        "fecha_hora": fecha_hora_fmt,
-        "cliente": cliente,
-        "num_cliente": num_cliente,
-        "proyecto": proyecto,
-        "modalidad": modalidad,
-        "observaciones": observaciones
-    })
-
+    sheet.append_row([
+        username,       # A: USUARIO
+        fecha_hora_fmt, # B: FECHA Y HORA
+        cliente,        # C: CLIENTE
+        num_cliente,    # D: NÚMERO DE CLIENTE
+        proyecto,       # E: PROYECTO
+        modalidad,      # F: MODALIDAD
+        observaciones   # G: OBSERVACIONES DEL RECORDATORIO
+    ])
     await update.message.reply_text(
         f"✅ ¡Cita registrada para {cliente} ({modalidad}) el {fecha_hora_fmt}!\n"
         f"Proyecto: {proyecto}\n"
@@ -199,7 +202,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "modalidad": modalidad,
             "proyecto": proyecto,
             "datetime": dt,
-            "doc_id": doc_ref.id
+            "row": sheet.row_count
         })
     except Exception as e:
         print("No se pudo programar recordatorio automático:", e)
@@ -207,10 +210,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[user_id] = {}
     update_memory(user_id, text, f"Registro completado para {cliente}")
 
-if __name__ == '__main__':
+if _name_ == '_main_':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🤖 Bot Lume listo y corriendo.")
     loop = asyncio.get_event_loop()
     loop.create_task(reminder_job(app))
     app.run_polling()
+    
