@@ -1,22 +1,16 @@
 import os
-import openai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 import datetime
-import asyncio
-from dateutil import parser as dateparser
 
 # ===== Cargar variables de entorno =====
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-
-openai.api_key = OPENAI_API_KEY
 
 # ===== Google Sheets config =====
 scope = [
@@ -27,195 +21,74 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scop
 gc = gspread.authorize(creds)
 sheet = gc.open(SHEET_NAME).sheet1
 
-# Estado temporal para cada usuario
-user_states = {}
-memory = {}
-reminders = []
-
-# Lista de campos requeridos (en orden)
-CAMPOS = [
-    ("cliente", "¿Cuál es el nombre del cliente?"),
-    ("num_cliente", "¿Cuál es el número del cliente (si aplica)?"),
-    ("proyecto", "¿Sobre qué proyecto es la reunión?"),
-    ("modalidad", "¿Modalidad? (presencial, virtual, reagendar llamada, etc)"),
-    ("fecha_hora", "¿Fecha y hora de la reunión? (Ej: 2025-06-02 18:00)"),
-    ("observaciones", "¿Alguna observación o detalle especial para este recordatorio? (puedes poner '-' si no hay)")
-]
-
-def update_memory(user_id, user_msg, assistant_msg):
-    if user_id not in memory:
-        memory[user_id] = []
-    memory[user_id].append({"role": "user", "content": user_msg})
-    memory[user_id].append({"role": "assistant", "content": assistant_msg})
-    memory[user_id] = memory[user_id][-15:]
-
-def get_memory(user_id):
-    return memory.get(user_id, [])
-
-async def reminder_job(application):
-    while True:
-        try:
-            now = datetime.datetime.now()
-            for r in list(reminders):
-                remind_at = r["datetime"] - datetime.timedelta(minutes=10)
-                if not r.get("notified") and now >= remind_at and now < r["datetime"]:
-                    await application.bot.send_message(
-                        chat_id=r["chat_id"],
-                        text=f"⏰ ¡Recordatorio! En 10 minutos tienes: {r['modalidad']} con {r['cliente']} ({r['proyecto']}) a las {r['datetime'].strftime('%H:%M')}."
-                    )
-                    r["notified"] = True
-                if not r.get("final") and now >= r["datetime"]:
-                    await application.bot.send_message(
-                        chat_id=r["chat_id"],
-                        text=f"🚩 ¡Tienes ahora la cita: {r['modalidad']} con {r['cliente']} ({r['proyecto']})!"
-                    )
-                    r["final"] = True
-            # Reporte al final del día (23:59)
-            if now.hour == 23 and now.minute >= 55:
-                for r in reminders:
-                    if not r.get("reportado"):
-                        await application.bot.send_message(
-                            chat_id=r["chat_id"],
-                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['row']} <observaciones>"
-                        )
-                        r["reportado"] = True
-            await asyncio.sleep(60)
-        except Exception as e:
-            print("Error en reminder_job:", e)
-            await asyncio.sleep(60)
-
-def buscar_citas_usuario_fecha(username, fecha_consulta=None):
+def buscar_citas_de_hoy(username=None):
     rows = sheet.get_all_records()
-    hoy = fecha_consulta or datetime.datetime.now().strftime("%Y-%m-%d")
+    hoy = datetime.datetime.now().strftime("%Y-%m-%d")
     citas = []
     for idx, row in enumerate(rows, 2):
-        if (row.get("USUARIO") == username and row.get("FECHA Y HORA")):
-            try:
-                fecha_row = dateparser.parse(str(row["FECHA Y HORA"]), dayfirst=False).strftime("%Y-%m-%d")
-            except Exception:
-                fecha_row = row["FECHA Y HORA"]
-            if fecha_row == hoy:
-                citas.append({
-                    "row": idx,
-                    "cliente": row.get("CLIENTE", ""),
-                    "modalidad": row.get("MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)", ""),
-                    "hora": dateparser.parse(str(row["FECHA Y HORA"])).strftime("%H:%M") if row.get("FECHA Y HORA") else "",
-                    "proyecto": row.get("PROYECTO", ""),
-                    "observaciones": row.get("OBSERVACIONES DEL RECORDATORIO", "")
-                })
+        try:
+            fecha = str(row.get("FECHA Y HORA", "")).split(" ")[0]
+            if fecha == hoy and (not username or row.get("USUARIO") == username):
+                citas.append(row)
+        except:
+            pass
     return citas
 
-def procesar_multi_linea(texto):
-    """Intenta extraer todos los campos si el usuario pega info tipo formulario."""
-    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
-    if len(lineas) >= 6:
-        return {
-            "cliente": lineas[0],
-            "num_cliente": lineas[1],
-            "proyecto": lineas[2],
-            "modalidad": lineas[3],
-            "fecha_hora": lineas[4],
-            "observaciones": lineas[5]
-        }
-    return {}
-
-async def solicitar_dato(update, estado):
-    for campo, pregunta in CAMPOS:
-        if campo not in estado or not estado[campo]:
-            await update.message.reply_text(pregunta)
-            return False
-    return True
+def buscar_por_cliente(cliente):
+    rows = sheet.get_all_records()
+    resultados = []
+    for row in rows:
+        if cliente.lower() in str(row.get("CLIENTE", "")).lower():
+            resultados.append(row)
+    return resultados
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    user_id = str(user.id)
+    text = update.message.text.strip().lower()
     username = user.username or user.first_name or "sin_usuario"
-    text = update.message.text.strip()
     
-    # RESET (por si quieres limpiar el flujo manualmente)
-    if text.lower() in ["/reset", "reset", "cancelar"]:
-        user_states[user_id] = {}
-        await update.message.reply_text("Flujo reiniciado. ¡Puedes empezar de nuevo!")
-        return
+    # Leer todo el sheet
+    if "leer" in text or "mostrar" in text:
+        rows = sheet.get_all_records()
+        respuesta = "Contenido del Sheet:\n"
+        for idx, row in enumerate(rows, 2):
+            respuesta += f"Fila {idx}: " + ", ".join([f"{k}: {v}" for k, v in row.items()]) + "\n"
+        await update.message.reply_text(respuesta[:4000])  # Telegram límite
+    
+    # Mostrar citas de hoy
+    elif "citas de hoy" in text or "hoy" in text:
+        citas = buscar_citas_de_hoy(username)
+        if citas:
+            respuesta = "Tus citas de hoy:\n"
+            for c in citas:
+                respuesta += ", ".join([f"{k}: {v}" for k, v in c.items()]) + "\n"
+        else:
+            respuesta = "No tienes citas registradas hoy."
+        await update.message.reply_text(respuesta[:4000])
+    
+    # Buscar por nombre de cliente
+    elif text.startswith("buscar "):
+        nombre = text.replace("buscar", "").strip()
+        resultados = buscar_por_cliente(nombre)
+        if resultados:
+            respuesta = f"Resultados para '{nombre}':\n"
+            for r in resultados:
+                respuesta += ", ".join([f"{k}: {v}" for k, v in r.items()]) + "\n"
+        else:
+            respuesta = f"No se encontraron resultados para '{nombre}'."
+        await update.message.reply_text(respuesta[:4000])
 
-    # RECOGE DATOS
-    if user_id not in user_states:
-        user_states[user_id] = {}
-    estado = user_states[user_id]
-
-    # Si responde tipo formulario (varias líneas)
-    if len(text.split("\n")) >= 6:
-        estado.update(procesar_multi_linea(text))
     else:
-        # Encuentra el primer campo faltante y lo completa
-        for campo, pregunta in CAMPOS:
-            if campo not in estado or not estado[campo]:
-                estado[campo] = text
-                break
-
-    # Chequea si todos los campos están completos
-    completos = await solicitar_dato(update, estado)
-    if not completos:
-        return
-
-    # Procesa el registro completo:
-    cliente = estado["cliente"]
-    num_cliente = estado["num_cliente"]
-    proyecto = estado["proyecto"]
-    modalidad = estado["modalidad"]
-    fecha_hora = estado["fecha_hora"]
-    observaciones = estado["observaciones"]
-
-    # Validación y formateo de fecha/hora
-    try:
-        dt = dateparser.parse(fecha_hora, dayfirst=True, fuzzy=True)
-        fecha_hora_fmt = dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        await update.message.reply_text("❌ No entendí la fecha/hora. Por favor, usa formato 2025-06-02 18:00")
-        estado["fecha_hora"] = ""
-        await solicitar_dato(update, estado)
-        return
-
-    # Guarda en el sheet
-    sheet.append_row([
-        username,       # A: USUARIO
-        fecha_hora_fmt, # B: FECHA Y HORA
-        cliente,        # C: CLIENTE
-        num_cliente,    # D: NÚMERO DE CLIENTE
-        proyecto,       # E: PROYECTO
-        modalidad,      # F: MODALIDAD
-        observaciones   # G: OBSERVACIONES DEL RECORDATORIO
-    ])
-    await update.message.reply_text(
-        f"✅ ¡Cita registrada para {cliente} ({modalidad}) el {fecha_hora_fmt}!\n"
-        f"Proyecto: {proyecto}\n"
-        f"Número de cliente: {num_cliente}\n"
-        f"Observaciones: {observaciones}\n"
-        "Recibirás recordatorios automáticos antes de la cita."
-    )
-
-    # Agrega recordatorio automático
-    try:
-        reminders.append({
-            "id": len(reminders)+2,
-            "chat_id": update.effective_chat.id,
-            "cliente": cliente,
-            "modalidad": modalidad,
-            "proyecto": proyecto,
-            "datetime": dt,
-            "row": sheet.row_count
-        })
-    except Exception as e:
-        print("No se pudo programar recordatorio automático:", e)
-
-    user_states[user_id] = {}
-    update_memory(user_id, text, f"Registro completado para {cliente}")
+        await update.message.reply_text(
+            "Comandos disponibles:\n"
+            "- leer / mostrar: Muestra todo el sheet\n"
+            "- citas de hoy: Muestra tus citas del día\n"
+            "- buscar <nombre>: Busca citas por nombre de cliente\n"
+        )
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Bot Lume listo y corriendo.")
-    loop = asyncio.get_event_loop()
-    loop.create_task(reminder_job(app))
+    print("🤖 Bot lector de Sheets listo.")
     app.run_polling()
 
