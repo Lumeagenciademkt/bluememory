@@ -7,6 +7,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filte
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import re
+import pytz
 
 # --- Cargar variables de entorno ---
 load_dotenv()
@@ -21,149 +22,204 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- CAMPOS PARA RECORDATORIOS ---
-RECORDATORIO_CAMPOS = [
+# --- Estados en memoria por usuario ---
+user_states = {}
+
+# --- Campos de recordatorio en orden ---
+CAMPOS = [
     ("cliente", "¿Cuál es el nombre del cliente?"),
     ("num_cliente", "¿Cuál es el número del cliente (si aplica)?"),
     ("proyecto", "¿Sobre qué proyecto es la reunión o cita?"),
     ("modalidad", "¿Modalidad? (presencial, virtual, reagendar llamada, etc)"),
     ("fecha_hora", "¿Fecha y hora de la cita? (Ej: 2025-06-02 18:00)"),
     ("motivo", "¿Motivo o asunto del recordatorio?"),
-    ("observaciones", "¿Alguna observación o detalle especial para este recordatorio? (puedes poner '-' si no hay)"),
+    ("observaciones", "¿Alguna observación o detalle especial para este recordatorio? (puedes poner '-' si no hay)")
 ]
 
-user_recordatorio = {}  # Guarda temporalmente la info por usuario
+# --- GPT Extraction (pide a GPT separar los campos del texto) ---
+def gpt_extract_fields(mensaje):
+    prompt = f"""
+Eres un asistente para agendas empresariales. Dado el siguiente mensaje de un usuario, extrae estos campos:
+- cliente
+- num_cliente
+- proyecto
+- modalidad
+- fecha_hora
+- motivo
+- observaciones
 
-# --- EXTRAER FECHA Y HORA CON VERSATILIDAD ---
-def parsear_fecha(texto):
-    # Soporta: hoy, mañana, fechas, horas sueltas, etc
+Si un campo no está presente, escribe "FALTA".
+
+Mensaje: \"{mensaje}\"
+Responde solo con un JSON.
+"""
+    respuesta = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    import json
+    try:
+        fields = json.loads(respuesta.choices[0].message.content)
+    except Exception:
+        fields = {}
+    return fields
+
+# --- Normaliza fecha y hora ---
+def normaliza_fecha(texto):
+    # Admite: "hoy a las 5pm", "mañana 14:00", "2025-06-03 17:00", "02/06/2025 15:00"
     texto = texto.lower()
-    ahora = datetime.now()
+    tz = pytz.timezone('America/Lima')
+    now = datetime.now(tz)
     if "mañana" in texto:
-        fecha = ahora + timedelta(days=1)
-        return fecha.strftime("%Y-%m-%d")
-    match = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
-    if match:
-        return match.group(1)
-    match2 = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", texto)
-    if match2:
-        d, m, y = match2.group(1).split("/")
-        return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-    return ahora.strftime("%Y-%m-%d")
+        base = now + timedelta(days=1)
+        texto = texto.replace("mañana", base.strftime("%Y-%m-%d"))
+    if "hoy" in texto:
+        texto = texto.replace("hoy", now.strftime("%Y-%m-%d"))
+    # Busca "YYYY-MM-DD HH:MM" o "DD/MM/YYYY HH:MM" o "5pm", etc.
+    fecha = None
+    for fmt in ["%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d %I%p", "%Y-%m-%d %H:%M", "%d/%m/%Y %I%p"]:
+        try:
+            fecha = datetime.strptime(texto, fmt)
+            return fecha.strftime("%Y-%m-%d %H:%M")
+        except:
+            continue
+    # Hora sola: "5pm", "17:00"
+    m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', texto)
+    if m:
+        h = int(m.group(1))
+        mnt = int(m.group(2) or 0)
+        if m.group(3):
+            if m.group(3) == 'pm' and h < 12: h += 12
+            if m.group(3) == 'am' and h == 12: h = 0
+        fecha = now.replace(hour=h, minute=mnt)
+        return fecha.strftime("%Y-%m-%d %H:%M")
+    return texto # Si no pudo, devuelve texto tal cual
 
-def parsear_hora(texto):
-    match = re.search(r"(\d{1,2})(?:[:h](\d{2}))?\s*(am|pm)?", texto)
-    if match:
-        hora = int(match.group(1))
-        minutos = int(match.group(2) or 0)
-        ampm = match.group(3)
-        if ampm:
-            if ampm.lower() == "pm" and hora < 12:
-                hora += 12
-            elif ampm.lower() == "am" and hora == 12:
-                hora = 0
-        return f"{hora:02}:{minutos:02}"
-    return "09:00"  # Hora por defecto
+# --- Flujo de llenado de recordatorio ---
+async def wizard_recordatorio(update, estado, text):
+    fields = gpt_extract_fields(text)
+    # Actualiza los campos si los encuentra
+    for campo, _ in CAMPOS:
+        valor = fields.get(campo)
+        if valor and valor != "FALTA":
+            if campo == "fecha_hora":
+                valor = normaliza_fecha(valor)
+            estado[campo] = valor
 
-def extraer_fecha_hora(texto):
-    # "mañana a las 3pm" -> 2025-06-03 15:00
-    fecha = parsear_fecha(texto)
-    hora = parsear_hora(texto)
-    return f"{fecha} {hora}"
-
-# --- FLUJO DE GUARDADO DE RECORDATORIO (UNO A UNO) ---
-async def pedir_siguiente_dato(user_id, update, estado):
-    for campo, pregunta in RECORDATORIO_CAMPOS:
+    # Pide el siguiente campo pendiente
+    for campo, pregunta in CAMPOS:
         if campo not in estado or not estado[campo]:
             await update.message.reply_text(pregunta)
-            return campo
-    return None  # Todos los campos completos
+            estado["last_campo"] = campo
+            return False
+    return True
 
-async def completar_recordatorio(update: Update, estado):
-    # Guarda en Firestore y limpia el estado del usuario
-    db.collection("recordatorios").add(estado)
-    await update.message.reply_text("✅ Recordatorio guardado. Pronto te avisaré aquí mismo.")
-    user_recordatorio.pop(update.message.from_user.id, None)
+# --- Consulta recordatorios por fecha ---
+def consulta_recordatorios(user_id, fecha_buscada):
+    docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
+    result = []
+    for doc in docs:
+        data = doc.to_dict()
+        fecha_hora = data.get("fecha_hora", "")
+        if fecha_hora.startswith(fecha_buscada):
+            result.append(data)
+    return result
 
+# --- Handler principal ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
-    user_name = user.username or ""
     text = update.message.text.strip()
+    user_name = user.username or user.first_name or "usuario"
 
-    # --- FLUJO DE CAPTURA DE RECORDATORIO EN CURSO ---
-    if user_id in user_recordatorio:
-        estado = user_recordatorio[user_id]
-        campo_actual = next((c for c, _ in RECORDATORIO_CAMPOS if not estado.get(c)), None)
-        if campo_actual:
-            estado[campo_actual] = text
-            # Pide el siguiente campo pendiente
-            siguiente = await pedir_siguiente_dato(user_id, update, estado)
-            if not siguiente:
-                # Si ya está completo
-                estado["user_id"] = user_id
-                estado["usuario"] = user.full_name
-                await completar_recordatorio(update, estado)
-        return
-
-    # --- INICIO: FLUJO DE AGENDADO ---
-    if any(w in text.lower() for w in ["agenda", "recordar", "cita"]):
-        # Intenta extraer algunos campos directamente
-        estado = {c: "" for c, _ in RECORDATORIO_CAMPOS}
-        estado["user_id"] = user_id
-        estado["usuario"] = user.full_name
-
-        # Extrae info básica automática (mejorable con GPT, aquí simple)
-        if "con" in text.lower():
-            try:
-                estado["cliente"] = text.lower().split("con", 1)[1].split()[0:3]
-                estado["cliente"] = " ".join(estado["cliente"])
-            except: pass
-        if "para" in text.lower():
-            try:
-                estado["motivo"] = text.lower().split("para", 1)[1].split()[0:8]
-                estado["motivo"] = " ".join(estado["motivo"])
-            except: pass
-        # Fecha/hora
-        if any(w in text.lower() for w in ["hoy", "mañana", "pm", "am", "/", "-"]):
-            estado["fecha_hora"] = extraer_fecha_hora(text)
-        # Pregunta los campos faltantes
-        user_recordatorio[user_id] = estado
-        await pedir_siguiente_dato(user_id, update, estado)
-        return
-
-    # --- CONSULTA DE RECORDATORIOS POR FECHA ---
-    if ("recordatorio" in text.lower() or "pendiente" in text.lower() or "reunión" in text.lower()) and ("hoy" in text.lower() or "mañana" in text.lower() or re.search(r"\d{1,2}/\d{1,2}/\d{4}", text) or re.search(r"\d{4}-\d{2}-\d{2}", text)):
-        # Determina fecha buscada
-        fecha_buscar = parsear_fecha(text)
-        docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
-        lista = []
-        for doc in docs:
-            data = doc.to_dict()
-            if data.get("fecha_hora", "").startswith(fecha_buscar):
-                desc = f"{data.get('fecha_hora', '')} - cliente {data.get('cliente', '')} - motivo: {data.get('motivo', '')}"
-                lista.append(desc)
-        if lista:
-            await update.message.reply_text("📅 Tus recordatorios para " + fecha_buscar + ":\n" + "\n".join(lista))
+    # --- Maneja estados por usuario (wizard para recordatorios) ---
+    estado = user_states.get(user_id, {})
+    if estado.get("en_proceso"):
+        # Está llenando campos pendientes
+        last = estado.get("last_campo")
+        if last:
+            # Normaliza fecha si corresponde
+            valor = text
+            if last == "fecha_hora":
+                valor = normaliza_fecha(valor)
+            estado[last] = valor
+        completos = True
+        # Busca siguiente campo pendiente
+        for campo, pregunta in CAMPOS:
+            if campo not in estado or not estado[campo]:
+                await update.message.reply_text(pregunta)
+                estado["last_campo"] = campo
+                completos = False
+                break
+        if completos:
+            # Guarda recordatorio y limpia estado
+            db.collection("recordatorios").add({
+                "user_id": user_id,
+                "usuario": user_name,
+                "cliente": estado.get("cliente", ""),
+                "num_cliente": estado.get("num_cliente", ""),
+                "proyecto": estado.get("proyecto", ""),
+                "modalidad": estado.get("modalidad", ""),
+                "fecha_hora": estado.get("fecha_hora", ""),
+                "motivo": estado.get("motivo", ""),
+                "observaciones": estado.get("observaciones", ""),
+            })
+            await update.message.reply_text("✅ Recordatorio guardado. Pronto te avisaré aquí mismo.")
+            user_states[user_id] = {}
         else:
-            await update.message.reply_text(f"No tienes recordatorios para {fecha_buscar}.")
+            user_states[user_id] = estado
         return
 
-    if "recordatorio" in text.lower() and "tengo" in text.lower():
-        # Lista TODOS los recordatorios
-        docs = db.collection("recordatorios").where("user_id", "==", user_id).stream()
-        lista = []
-        for doc in docs:
-            data = doc.to_dict()
-            desc = f"{data.get('fecha_hora','')} - cliente {data.get('cliente','')} - motivo: {data.get('motivo','')}"
-            lista.append(desc)
-        if lista:
-            await update.message.reply_text("📅 Todos tus recordatorios:\n" + "\n".join(lista))
+    # --- Nueva solicitud de recordatorio ---
+    if any(x in text.lower() for x in ["agenda", "recordar", "cita", "reunión"]):
+        user_states[user_id] = {"en_proceso": True}
+        completos = await wizard_recordatorio(update, user_states[user_id], text)
+        if completos:
+            # Guarda directamente si extrajo todo
+            estado = user_states[user_id]
+            db.collection("recordatorios").add({
+                "user_id": user_id,
+                "usuario": user_name,
+                "cliente": estado.get("cliente", ""),
+                "num_cliente": estado.get("num_cliente", ""),
+                "proyecto": estado.get("proyecto", ""),
+                "modalidad": estado.get("modalidad", ""),
+                "fecha_hora": estado.get("fecha_hora", ""),
+                "motivo": estado.get("motivo", ""),
+                "observaciones": estado.get("observaciones", ""),
+            })
+            await update.message.reply_text("✅ Recordatorio guardado. Pronto te avisaré aquí mismo.")
+            user_states[user_id] = {}
+        return
+
+    # --- Consulta de recordatorios por fecha ---
+    if "recordatorio" in text.lower() or "pendiente" in text.lower() or "reunión" in text.lower():
+        # Detecta fecha buscada: hoy, mañana, fecha explícita
+        tz = pytz.timezone('America/Lima')
+        now = datetime.now(tz)
+        if "mañana" in text.lower():
+            fecha_buscada = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif "hoy" in text.lower():
+            fecha_buscada = now.strftime("%Y-%m-%d")
         else:
-            await update.message.reply_text("No tienes ningún recordatorio guardado.")
+            # Busca fecha explícita
+            m = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+            if m:
+                fecha_buscada = m.group(1)
+            else:
+                fecha_buscada = now.strftime("%Y-%m-%d")
+        recordatorios = consulta_recordatorios(user_id, fecha_buscada)
+        if recordatorios:
+            lista = [
+                f"{r.get('fecha_hora','')} - {r.get('motivo','')} {r.get('cliente','')}"
+                for r in recordatorios
+            ]
+            await update.message.reply_text("📅 Tus recordatorios para esa fecha:\n" + "\n".join(lista))
+        else:
+            await update.message.reply_text("No tienes recordatorios para esa fecha.")
         return
 
-    # --- CHAT NORMAL GPT-4o (BLUE) ---
+    # --- Chat normal GPT-4o ---
     system_prompt = (
         "Eres Blue, un asistente personal para organización en Telegram. "
         "Tu objetivo principal es ayudar al usuario a organizar su día, agendar recordatorios y citas, "
@@ -174,7 +230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         model="gpt-4o",
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": update.message.text}
+            {"role": "user", "content": text}
         ]
     )
     gpt_reply = response.choices[0].message.content.strip()
@@ -184,7 +240,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.collection("chats").add({
         "user_id": user_id,
         "user_name": user_name,
-        "mensaje": update.message.text,
+        "mensaje": text,
         "respuesta": gpt_reply,
         "fecha": datetime.now()
     })
@@ -192,6 +248,5 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Blue listo y corriendo.")
+    print("🤖 Blue listo y corriendo, ahora sí extrae y pregunta cada campo, filtra bien por fecha, y responde mejor.")
     app.run_polling()
-
