@@ -8,13 +8,16 @@ from dotenv import load_dotenv
 import datetime
 import asyncio
 from dateutil import parser as dateparser
+import json
 
 # ===== Cargar variables de entorno =====
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-openai.api_key = OPENAI_API_KEY
+
+# Configura el cliente OpenAI al nuevo estilo
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # ===== Firebase config =====
 if not firebase_admin._apps:
@@ -112,13 +115,13 @@ Si un campo no está presente, escribe "FALTA".
 Mensaje: \"{mensaje}\"
 Responde solo con un JSON.
 """
-    respuesta = openai.ChatCompletion.create(
+    respuesta = openai_client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}]
     )
-    import json
     try:
-        fields = json.loads(respuesta.choices[0].message.content)
+        content = respuesta.choices[0].message.content
+        fields = json.loads(content)
     except Exception:
         fields = {}
     return fields
@@ -233,4 +236,5 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     loop.create_task(reminder_job(app))
     app.run_polling()
+
 
