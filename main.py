@@ -1,220 +1,167 @@
 import os
 import openai
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import firebase_admin
+from firebase_admin import credentials, firestore
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+from dateutil import parser as dateparser
 import datetime
 import asyncio
-from dateutil import parser as dateparser
 
-# ===== Cargar variables de entorno =====
+# Cargar variables de entorno
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 openai.api_key = OPENAI_API_KEY
 
-# ===== Google Sheets config =====
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scope)
-gc = gspread.authorize(creds)
-sheet = gc.open(SHEET_NAME).sheet1
+# Inicializar Firebase Admin
+cred = credentials.Certificate(GOOGLE_CREDS_JSON)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
 # Estado temporal para cada usuario
 user_states = {}
-memory = {}
-reminders = []
 
-# Lista de campos requeridos (en orden)
+# Campos requeridos para registrar una cita
 CAMPOS = [
     ("cliente", "¿Cuál es el nombre del cliente?"),
     ("num_cliente", "¿Cuál es el número del cliente (si aplica)?"),
     ("proyecto", "¿Sobre qué proyecto es la reunión?"),
-    ("modalidad", "¿Modalidad? (presencial, virtual, reagendar llamada, etc)"),
+    ("modalidad", "¿Modalidad? (presencial, virtual, etc)"),
     ("fecha_hora", "¿Fecha y hora de la reunión? (Ej: 2025-06-02 18:00)"),
     ("observaciones", "¿Alguna observación o detalle especial para este recordatorio? (puedes poner '-' si no hay)")
 ]
 
-def update_memory(user_id, user_msg, assistant_msg):
-    if user_id not in memory:
-        memory[user_id] = []
-    memory[user_id].append({"role": "user", "content": user_msg})
-    memory[user_id].append({"role": "assistant", "content": assistant_msg})
-    memory[user_id] = memory[user_id][-15:]
+# -------------------- FUNCIONES FIREBASE --------------------
 
-def get_memory(user_id):
-    return memory.get(user_id, [])
+def guardar_cita(user, data):
+    """Guarda una cita en Firestore."""
+    data['usuario'] = user
+    db.collection("citas").add(data)
 
-async def reminder_job(application):
-    while True:
+def buscar_citas_por_fecha(fecha_busqueda):
+    """Busca citas en una fecha específica."""
+    results = []
+    citas_ref = db.collection("citas").stream()
+    for c in citas_ref:
+        cita = c.to_dict()
         try:
-            now = datetime.datetime.now()
-            for r in list(reminders):
-                remind_at = r["datetime"] - datetime.timedelta(minutes=10)
-                if not r.get("notified") and now >= remind_at and now < r["datetime"]:
-                    await application.bot.send_message(
-                        chat_id=r["chat_id"],
-                        text=f"⏰ ¡Recordatorio! En 10 minutos tienes: {r['modalidad']} con {r['cliente']} ({r['proyecto']}) a las {r['datetime'].strftime('%H:%M')}."
-                    )
-                    r["notified"] = True
-                if not r.get("final") and now >= r["datetime"]:
-                    await application.bot.send_message(
-                        chat_id=r["chat_id"],
-                        text=f"🚩 ¡Tienes ahora la cita: {r['modalidad']} con {r['cliente']} ({r['proyecto']})!"
-                    )
-                    r["final"] = True
-            # Reporte al final del día (23:59)
-            if now.hour == 23 and now.minute >= 55:
-                for r in reminders:
-                    if not r.get("reportado"):
-                        await application.bot.send_message(
-                            chat_id=r["chat_id"],
-                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['row']} <observaciones>"
-                        )
-                        r["reportado"] = True
-            await asyncio.sleep(60)
-        except Exception as e:
-            print("Error en reminder_job:", e)
-            await asyncio.sleep(60)
+            fecha_cita = dateparser.parse(cita['fecha_hora'])
+            if fecha_cita.date() == fecha_busqueda.date():
+                results.append(cita)
+        except:
+            continue
+    return results
 
-def buscar_citas_usuario_fecha(username, fecha_consulta=None):
-    rows = sheet.get_all_records()
-    hoy = fecha_consulta or datetime.datetime.now().strftime("%Y-%m-%d")
-    citas = []
-    for idx, row in enumerate(rows, 2):
-        if (row.get("USUARIO") == username and row.get("FECHA Y HORA")):
-            try:
-                fecha_row = dateparser.parse(str(row["FECHA Y HORA"]), dayfirst=False).strftime("%Y-%m-%d")
-            except Exception:
-                fecha_row = row["FECHA Y HORA"]
-            if fecha_row == hoy:
-                citas.append({
-                    "row": idx,
-                    "cliente": row.get("CLIENTE", ""),
-                    "modalidad": row.get("MODALIDAD (CITA PRESENCIAL O CITA VIRTUAL O SOLO REAGENDAR UNA LLAMADA)", ""),
-                    "hora": dateparser.parse(str(row["FECHA Y HORA"])).strftime("%H:%M") if row.get("FECHA Y HORA") else "",
-                    "proyecto": row.get("PROYECTO", ""),
-                    "observaciones": row.get("OBSERVACIONES DEL RECORDATORIO", "")
-                })
-    return citas
+def buscar_citas_por_cliente(nombre_cliente):
+    """Busca citas por nombre del cliente."""
+    citas_ref = db.collection("citas").where("cliente", "==", nombre_cliente).stream()
+    return [c.to_dict() for c in citas_ref]
 
-async def solicitar_dato(update, estado):
-    for campo, pregunta in CAMPOS:
-        if campo not in estado or not estado[campo]:
-            await update.message.reply_text(pregunta)
-            return False
-    return True
+def todas_las_citas():
+    """Lista todas las citas."""
+    return [c.to_dict() for c in db.collection("citas").stream()]
+
+# -------------------- FLUJO TELEGRAM --------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
-    username = user.username
-    text = update.message.text.strip()
+    username = user.username or user.first_name or "sin_usuario"
+    text = update.message.text.strip().lower()
+
+    # Reseteo del flujo
+    if text in ["/reset", "reset", "cancelar"]:
+        user_states[user_id] = {}
+        await update.message.reply_text("¡Flujo reiniciado! Puedes empezar de nuevo o preguntarme lo que sea.")
+        return
+
+    # --- Consulta de citas ---
+    if "citas hoy" in text:
+        hoy = datetime.datetime.now()
+        citas = buscar_citas_por_fecha(hoy)
+        if citas:
+            msg = "📅 Citas para hoy:\n" + "\n".join([f"- {c['cliente']} ({c['proyecto']}) {c['fecha_hora']}" for c in citas])
+        else:
+            msg = "No hay citas para hoy."
+        await update.message.reply_text(msg)
+        return
+
+    if text.startswith("citas ") and len(text.split()) == 2:
+        try:
+            fecha = dateparser.parse(text.split()[1])
+            citas = buscar_citas_por_fecha(fecha)
+            if citas:
+                msg = f"📅 Citas para {fecha.strftime('%Y-%m-%d')}:\n" + "\n".join([f"- {c['cliente']} ({c['proyecto']}) {c['fecha_hora']}" for c in citas])
+            else:
+                msg = "No hay citas para esa fecha."
+            await update.message.reply_text(msg)
+        except:
+            await update.message.reply_text("No entendí la fecha. Usa el formato: citas 2025-06-02")
+        return
+
+    if text.startswith("buscar "):
+        cliente = text.replace("buscar ", "").strip()
+        citas = buscar_citas_por_cliente(cliente)
+        if citas:
+            msg = f"🔎 Citas encontradas para {cliente}:\n" + "\n".join([f"- {c['cliente']} ({c['proyecto']}) {c['fecha_hora']}" for c in citas])
+        else:
+            msg = f"No hay citas encontradas para {cliente}."
+        await update.message.reply_text(msg)
+        return
+
+    if "todas las citas" in text or "ver todas" in text:
+        citas = todas_las_citas()
+        if citas:
+            msg = "📑 Todas las citas:\n" + "\n".join([f"- {c['cliente']} ({c['proyecto']}) {c['fecha_hora']}" for c in citas])
+        else:
+            msg = "No hay citas registradas."
+        await update.message.reply_text(msg)
+        return
+
+    # --- Registro de citas ---
     if user_id not in user_states:
         user_states[user_id] = {}
 
     estado = user_states[user_id]
 
-    # === Reportar resultado de cita ===
-    if text.lower().startswith("reporte "):
-        try:
-            _, rec_id, *detalle = text.split(" ")
-            detalle = " ".join(detalle)
-            if rec_id.isdigit():
-                row_idx = int(rec_id)
-                sheet.update_cell(row_idx, 7, detalle) # Columna G: Observaciones del recordatorio
-                await update.message.reply_text("📝 ¡Reporte/Observación guardada! Gracias.")
-            else:
-                await update.message.reply_text("ID inválido. Usa el número de fila del Sheet.")
-        except Exception:
-            await update.message.reply_text("❌ No se pudo registrar la observación. Usa: reporte <fila> <observaciones>")
-        return
-
-    # === Consulta de reuniones/citas del día ===
-    if "reuniones" in text.lower() or "citas" in text.lower() or "pendientes" in text.lower():
-        citas_hoy = buscar_citas_usuario_fecha(username)
-        if citas_hoy:
-            respuesta = "📅 Tus reuniones/citas de hoy:\n"
-            for c in citas_hoy:
-                respuesta += f"Fila {c['row']}: {c['modalidad']} con {c['cliente']} ({c['proyecto']}) a las {c['hora']} - Obs: {c['observaciones']}\n"
-            await update.message.reply_text(respuesta)
-        else:
-            await update.message.reply_text("No tienes reuniones/citas registradas hoy.")
-        return
-
-    # === Recolecta datos uno a uno ===
     for campo, pregunta in CAMPOS:
         if campo not in estado or not estado[campo]:
-            estado[campo] = text
+            estado[campo] = update.message.text
+            if campo != CAMPOS[-1][0]:
+                await update.message.reply_text(pregunta)
             break
 
-    completos = await solicitar_dato(update, estado)
-    if not completos:
+    # Si todos los campos están llenos, guarda la cita
+    if all([estado.get(campo[0], "") for campo in CAMPOS]):
+        cita_data = {campo[0]: estado[campo[0]] for campo in CAMPOS}
+        guardar_cita(username, cita_data)
+        await update.message.reply_text(
+            f"✅ ¡Cita registrada para {cita_data['cliente']} el {cita_data['fecha_hora']}!\n"
+            f"Proyecto: {cita_data['proyecto']}\n"
+            f"Modalidad: {cita_data['modalidad']}\n"
+            f"Observaciones: {cita_data['observaciones']}\n"
+        )
+        user_states[user_id] = {}
         return
 
-    # Procesa el registro completo:
-    cliente = estado["cliente"]
-    num_cliente = estado["num_cliente"]
-    proyecto = estado["proyecto"]
-    modalidad = estado["modalidad"]
-    fecha_hora = estado["fecha_hora"]
-    observaciones = estado["observaciones"]
+    # --- Conversación normal con GPT ---
+    if not any(x in text for x in ["citas", "cliente", "proyecto", "modalidad", "observacion"]):
+        # Respuesta casual con GPT
+        try:
+            respuesta = openai.ChatCompletion.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": update.message.text}]
+            )
+            await update.message.reply_text(respuesta.choices[0].message.content.strip())
+        except Exception as e:
+            await update.message.reply_text("¡Ups! No pude responder en este momento. Intenta de nuevo.")
 
-    try:
-        dt = dateparser.parse(fecha_hora)
-        fecha_hora_fmt = dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        await update.message.reply_text("❌ No entendí la fecha/hora. Por favor, usa formato 2025-06-02 18:00")
-        estado["fecha_hora"] = ""
-        await solicitar_dato(update, estado)
-        return
-
-    sheet.append_row([
-        username,       # A: USUARIO
-        fecha_hora_fmt, # B: FECHA Y HORA
-        cliente,        # C: CLIENTE
-        num_cliente,    # D: NÚMERO DE CLIENTE
-        proyecto,       # E: PROYECTO
-        modalidad,      # F: MODALIDAD
-        observaciones   # G: OBSERVACIONES DEL RECORDATORIO
-    ])
-    await update.message.reply_text(
-        f"✅ ¡Cita registrada para {cliente} ({modalidad}) el {fecha_hora_fmt}!\n"
-        f"Proyecto: {proyecto}\n"
-        f"Número de cliente: {num_cliente}\n"
-        f"Observaciones: {observaciones}\n"
-        "Recibirás recordatorios automáticos antes de la cita."
-    )
-
-    # Agrega recordatorio automático
-    try:
-        reminders.append({
-            "id": len(reminders)+2,
-            "chat_id": update.effective_chat.id,
-            "cliente": cliente,
-            "modalidad": modalidad,
-            "proyecto": proyecto,
-            "datetime": dt,
-            "row": sheet.row_count
-        })
-    except Exception as e:
-        print("No se pudo programar recordatorio automático:", e)
-
-    user_states[user_id] = {}
-    update_memory(user_id, text, f"Registro completado para {cliente}")
-
-if _name_ == '_main_':
+if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Bot Lume listo y corriendo.")
-    loop = asyncio.get_event_loop()
-    loop.create_task(reminder_job(app))
+    print("🤖 Bot Blue listo y corriendo.")
     app.run_polling()
-    
