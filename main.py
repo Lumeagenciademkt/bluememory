@@ -13,11 +13,11 @@ from google.cloud import firestore
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # Ruta al .json de Firebase
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 openai.api_key = OPENAI_API_KEY
 
-# ===== Firebase Firestore config =====
+# ===== Firestore config =====
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDS_JSON
 db = firestore.Client()
 
@@ -70,7 +70,7 @@ async def reminder_job(application):
                     if not r.get("reportado"):
                         await application.bot.send_message(
                             chat_id=r["chat_id"],
-                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['id']} <observaciones>"
+                            text=f"¿Qué pasó con la cita '{r['modalidad']}' con {r['cliente']} a las {r['datetime'].strftime('%H:%M')}? Responde con: reporte {r['doc_id']} <observaciones>"
                         )
                         r["reportado"] = True
             await asyncio.sleep(60)
@@ -79,26 +79,25 @@ async def reminder_job(application):
             await asyncio.sleep(60)
 
 def buscar_citas_usuario_fecha(username, fecha_consulta=None):
-    # Busca todas las citas de ese usuario en una fecha específica (YYYY-MM-DD)
     hoy = fecha_consulta or datetime.datetime.now().strftime("%Y-%m-%d")
     citas = []
     docs = db.collection("citas").where("usuario", "==", username).stream()
     for doc in docs:
-        data = doc.to_dict()
-        fecha_str = data.get("fecha_hora", "")
-        try:
-            fecha_row = dateparser.parse(str(fecha_str), dayfirst=False).strftime("%Y-%m-%d")
-        except Exception:
-            fecha_row = fecha_str
-        if fecha_row == hoy:
-            citas.append({
-                "id": doc.id,
-                "cliente": data.get("cliente", ""),
-                "modalidad": data.get("modalidad", ""),
-                "hora": dateparser.parse(str(fecha_str)).strftime("%H:%M") if fecha_str else "",
-                "proyecto": data.get("proyecto", ""),
-                "observaciones": data.get("observaciones", "")
-            })
+        row = doc.to_dict()
+        if "fecha_hora" in row:
+            try:
+                fecha_row = dateparser.parse(str(row["fecha_hora"]), dayfirst=False).strftime("%Y-%m-%d")
+            except Exception:
+                fecha_row = row["fecha_hora"]
+            if fecha_row == hoy:
+                citas.append({
+                    "doc_id": doc.id,
+                    "cliente": row.get("cliente", ""),
+                    "modalidad": row.get("modalidad", ""),
+                    "hora": dateparser.parse(str(row["fecha_hora"])).strftime("%H:%M") if row.get("fecha_hora") else "",
+                    "proyecto": row.get("proyecto", ""),
+                    "observaciones": row.get("observaciones", "")
+                })
     return citas
 
 async def solicitar_dato(update, estado):
@@ -111,7 +110,7 @@ async def solicitar_dato(update, estado):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
-    username = user.username or user_id
+    username = user.username
     text = update.message.text.strip()
     if user_id not in user_states:
         user_states[user_id] = {}
@@ -121,17 +120,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Reportar resultado de cita ===
     if text.lower().startswith("reporte "):
         try:
-            _, cita_id, *detalle = text.split(" ")
+            _, doc_id, *detalle = text.split(" ")
             detalle = " ".join(detalle)
-            if cita_id:
-                # Busca la cita y actualiza el campo observaciones
-                cita_ref = db.collection("citas").document(cita_id)
-                cita_ref.update({"observaciones": detalle})
+            if doc_id:
+                db.collection("citas").document(doc_id).update({"observaciones": detalle})
                 await update.message.reply_text("📝 ¡Reporte/Observación guardada! Gracias.")
             else:
-                await update.message.reply_text("ID inválido. Usa el ID de la cita mostrado en el resumen.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ No se pudo registrar la observación. Usa: reporte <id_cita> <observaciones>\nError: {e}")
+                await update.message.reply_text("ID inválido. Usa el ID del recordatorio.")
+        except Exception:
+            await update.message.reply_text("❌ No se pudo registrar la observación. Usa: reporte <ID> <observaciones>")
         return
 
     # === Consulta de reuniones/citas del día ===
@@ -140,7 +137,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if citas_hoy:
             respuesta = "📅 Tus reuniones/citas de hoy:\n"
             for c in citas_hoy:
-                respuesta += f"ID {c['id']}: {c['modalidad']} con {c['cliente']} ({c['proyecto']}) a las {c['hora']} - Obs: {c['observaciones']}\n"
+                respuesta += f"ID {c['doc_id']}: {c['modalidad']} con {c['cliente']} ({c['proyecto']}) a las {c['hora']} - Obs: {c['observaciones']}\n"
             await update.message.reply_text(respuesta)
         else:
             await update.message.reply_text("No tienes reuniones/citas registradas hoy.")
@@ -173,7 +170,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await solicitar_dato(update, estado)
         return
 
-    # === Guarda en Firestore ===
+    # Guarda en Firestore
     doc_ref = db.collection("citas").document()
     doc_ref.set({
         "usuario": username,
@@ -196,12 +193,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Agrega recordatorio automático
     try:
         reminders.append({
-            "id": doc_ref.id,
+            "id": len(reminders)+2,
             "chat_id": update.effective_chat.id,
             "cliente": cliente,
             "modalidad": modalidad,
             "proyecto": proyecto,
             "datetime": dt,
+            "doc_id": doc_ref.id
         })
     except Exception as e:
         print("No se pudo programar recordatorio automático:", e)
