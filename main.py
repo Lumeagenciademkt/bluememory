@@ -10,6 +10,7 @@ import pytz
 import dateparser
 import re
 import json
+from rapidfuzz import fuzz
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -135,6 +136,27 @@ async def consulta_citas(update, context, fecha=None, campo=None, valor=None):
             msg += f"🗓️ {f} - {c.get('cliente','')} ({c.get('proyecto','')})\nObs: {c.get('observaciones','')}\n\n"
     await update.message.reply_text(msg)
 
+async def consulta_observaciones_similar(update, context, query_text):
+    chat_id = update.effective_chat.id
+    user_id = chat_id
+    records = db.collection("recordatorios").where("telegram_id", "==", user_id).stream()
+    resultados = []
+    for r in records:
+        d = r.to_dict()
+        obs = d.get("observaciones", "")
+        score = fuzz.token_set_ratio(query_text.lower(), obs.lower())
+        if score > 60:  # umbral ajustable
+            resultados.append((score, d))
+    if not resultados:
+        await update.message.reply_text("No encontré ningún recordatorio que coincida lo suficiente en las observaciones.")
+        return
+    resultados = sorted(resultados, key=lambda x: x[0], reverse=True)
+    msg = "Resultados más similares en tus observaciones:\n\n"
+    for score, c in resultados[:5]:
+        f = c.get("fecha_hora", "")[:16].replace("T", " ")
+        msg += f"🗓️ {f} - {c.get('cliente','')} ({c.get('proyecto','')})\nObs: {c.get('observaciones','')}\nSimilitud: {score}%\n\n"
+    await update.message.reply_text(msg)
+
 async def responder_gpt(update, texto):
     response = openai.chat.completions.create(
         model="gpt-4o",
@@ -189,8 +211,34 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[chat_id] = {}
             return
 
+    # Confirmación para búsqueda difusa en observaciones
+    if estado == "confirmar_observacion_similar":
+        if texto.lower() in ["sí", "si", "ok", "dale", "confirmo"]:
+            query_text = user_states[chat_id]["query_text"]
+            await consulta_observaciones_similar(update, context, query_text)
+            user_states[chat_id] = {}
+            return
+        else:
+            await update.message.reply_text("OK, búsqueda cancelada.")
+            user_states[chat_id] = {}
+            return
+
     # Modo Neomind: interpretación global de la intención (via GPT-4o)
     gpt_result = prompt_gpt_neomind(texto)
+
+    # Búsqueda difusa por observaciones si no detecta campo ni fecha pero el mensaje es descriptivo
+    if (
+        gpt_result["intencion"] == "consultar"
+        and not gpt_result.get("busqueda", {}).get("campo", "")
+        and not gpt_result.get("fecha", "")
+        and len(texto.split()) > 5
+    ):
+        user_states[chat_id]["estado"] = "confirmar_observacion_similar"
+        user_states[chat_id]["query_text"] = texto
+        await update.message.reply_text(
+            f"¿Quieres buscar entre las observaciones de tus recordatorios por: '{texto}'? (Responde sí para confirmar)"
+        )
+        return
 
     if gpt_result["intencion"] == "consultar":
         campo = gpt_result.get("busqueda", {}).get("campo", "")
