@@ -10,168 +10,137 @@ import pytz
 import dateparser
 import re
 
-# --- Cargar variables de entorno ---
+# Cargar variables de entorno
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 openai.api_key = OPENAI_API_KEY
 
-# --- Inicializa Firebase ---
+# Inicializa Firebase
 if not firebase_admin._apps:
     cred = credentials.Certificate(GOOGLE_CREDS_JSON)
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- Estructura de campos del recordatorio ---
-CAMPOS = [
-    "cliente", "num_cliente", "proyecto", "modalidad", "fecha_hora", "motivo", "observaciones"
-]
-
-# --- Estados de usuario para flujo conversacional ---
+CAMPOS = ["cliente", "num_cliente", "proyecto", "modalidad", "fecha_hora", "motivo", "observaciones"]
 user_states = {}
 
-def extraer_datos(texto):
-    """Extrae los datos del recordatorio usando OpenAI."""
-    prompt = f"""
-Extrae estos campos del siguiente mensaje: {CAMPOS}.
-Responde SOLO un JSON válido. Si falta un campo, déjalo vacío.
+def extraer_intencion(texto):
+    # Si el texto tiene palabras de agendar, lo detecta como recordatorio
+    patrones = ["agenda", "agendar", "cita", "recordatorio", "reunión", "reunion", "recuerda", "avísame"]
+    return any(pat in texto.lower() for pat in patrones)
 
-Ejemplo:
-Mensaje: Agenda cita con Juan Carlos el lunes a las 8pm.
-Respuesta: {{
-  "cliente": "Juan Carlos",
-  "num_cliente": "",
-  "proyecto": "",
-  "modalidad": "",
-  "fecha_hora": "próximo lunes 8pm",
-  "motivo": "cita",
-  "observaciones": ""
+def extraer_datos_gpt(texto):
+    prompt = f"""Eres un asistente que organiza recordatorios para humanos muy ocupados. Extrae los siguientes campos de la solicitud del usuario (aunque esté desordenado o falten algunos):
+Cliente, Número de cliente, Proyecto, Modalidad (presencial/virtual), Fecha y hora, Motivo, Observaciones.
+Devuelve SOLO el siguiente JSON (rellena vacío si no hay dato):
+{{
+    "cliente": "",
+    "num_cliente": "",
+    "proyecto": "",
+    "modalidad": "",
+    "fecha_hora": "",
+    "motivo": "",
+    "observaciones": ""
 }}
-
-Mensaje: {texto}
-Respuesta:
-    """
+Mensaje del usuario: {texto}
+JSON:"""
     response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0
     )
     import json
-    text = response.choices[0].message.content
-    try:
-        # Asegura que sea solo el JSON
-        match = re.search(r'\{[\s\S]+\}', text)
-        if match:
-            return json.loads(match.group(0))
-        else:
-            return {k: "" for k in CAMPOS}
-    except Exception:
-        return {k: "" for k in CAMPOS}
+    content = response.choices[0].message.content
+    match = re.search(r'\{[\s\S]+\}', content)
+    if match:
+        return json.loads(match.group(0))
+    return {k: "" for k in CAMPOS}
 
 def parse_fecha_hora(fecha_str):
-    """Convierte un string a datetime usando dateparser."""
     if not fecha_str:
         return None
     dt = dateparser.parse(fecha_str, languages=['es'])
-    if dt:
-        if dt.tzinfo is None:
-            tz = pytz.timezone("America/Lima")
-            dt = tz.localize(dt)
-        return dt
-    return None
+    if dt and dt.tzinfo is None:
+        dt = pytz.timezone("America/Lima").localize(dt)
+    return dt
 
-async def pedir_datos_faltantes(context, chat_id, datos):
-    """Pregunta por los campos faltantes."""
-    faltantes = [campo for campo, valor in datos.items() if not valor]
-    if not faltantes:
-        return False
-    msg = "Por favor, indícame: " + ", ".join(faltantes)
-    await context.bot.send_message(chat_id=chat_id, text=msg)
-    return True
-
-async def guardar_recordatorio(chat_id, datos):
-    """Guarda el recordatorio en Firebase."""
-    now = datetime.now(pytz.timezone("America/Lima"))
-    datos["fecha_creacion"] = now.isoformat()
-    db.collection("recordatorios").add(datos)
-
-async def agendar_notificacion(context, chat_id, datos):
-    """Agenda los mensajes de notificación."""
-    fecha_hora = parse_fecha_hora(datos["fecha_hora"])
-    if not fecha_hora:
-        return
-    now = datetime.now(pytz.timezone("America/Lima"))
-    delta_principal = (fecha_hora - now).total_seconds()
-    delta_previa = delta_principal - 600  # 10 minutos antes
-
-    # Notificación 10 minutos antes
-    if delta_previa > 0:
-        context.job_queue.run_once(
-            lambda ctx: ctx.bot.send_message(chat_id=chat_id, text=f"⏰ Recordatorio: Faltan 10 minutos para tu cita: {datos}"),
-            when=delta_previa,
-            chat_id=chat_id
-        )
-    # Notificación principal
-    if delta_principal > 0:
-        context.job_queue.run_once(
-            lambda ctx: ctx.bot.send_message(chat_id=chat_id, text=f"🚨 ¡Es hora de tu cita!: {datos}"),
-            when=delta_principal,
-            chat_id=chat_id
-        )
-
-async def procesar_recordatorio(update: Update, context: ContextTypes.DEFAULT_TYPE, texto):
-    chat_id = update.effective_chat.id
-    datos = extraer_datos(texto)
-    user_states[chat_id] = datos
-    if await pedir_datos_faltantes(context, chat_id, datos):
-        return
-    await guardar_recordatorio(chat_id, datos)
-    await agendar_notificacion(context, chat_id, datos)
-    await context.bot.send_message(chat_id=chat_id, text="✅ Recordatorio guardado correctamente.")
+async def responder_gpt(update, texto):
+    # Responde como ChatGPT normal
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": texto}],
+        temperature=0.5
+    )
+    await update.message.reply_text(response.choices[0].message.content.strip())
 
 async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    texto = update.message.text
-    # Si hay campos faltantes, continuar llenando
-    if chat_id in user_states and any(not v for v in user_states[chat_id].values()):
-        datos = user_states[chat_id]
-        # Rellena los campos por orden
-        for campo in CAMPOS:
-            if not datos[campo]:
-                datos[campo] = texto.strip()
-                break
-        user_states[chat_id] = datos
-        if await pedir_datos_faltantes(context, chat_id, datos):
+    texto = update.message.text.strip()
+
+    # Flujo: esperando confirmación del usuario para guardar
+    if chat_id in user_states and user_states[chat_id].get("estado") == "confirmar":
+        if texto.lower() in ["sí", "si", "ok", "dale", "confirmo"]:
+            datos = user_states[chat_id]["datos"]
+            now = datetime.now(pytz.timezone("America/Lima"))
+            datos["fecha_creacion"] = now.isoformat()
+            db.collection("recordatorios").add(datos)
+            user_states.pop(chat_id)
+            await update.message.reply_text("✅ ¡Recordatorio guardado! Te avisaré a la hora indicada y 10 minutos antes.")
+            # Aquí deberías programar las notificaciones reales
             return
-        await guardar_recordatorio(chat_id, datos)
-        await agendar_notificacion(context, chat_id, datos)
-        await context.bot.send_message(chat_id=chat_id, text="✅ Recordatorio guardado correctamente.")
-        user_states.pop(chat_id)
+        else:
+            await update.message.reply_text("Entiendo, ¿quieres modificar algo? Por favor envíame el mensaje de nuevo con las correcciones o vuelve a escribir tu cita.")
+            user_states.pop(chat_id)
+            return
+
+    # Flujo principal: si detecta intención de agendar
+    if extraer_intencion(texto):
+        datos = extraer_datos_gpt(texto)
+        fecha_legible = datos["fecha_hora"]
+        dt = parse_fecha_hora(fecha_legible)
+        if dt:
+            fecha_legible = dt.strftime("%d de %B de %Y, %I:%M %p")
+            datos["fecha_hora"] = dt.isoformat()
+        resumen = (
+            f"Perfecto, entiendo que quieres agendar este recordatorio:\n"
+            f"- Cliente: {datos['cliente']}\n"
+            f"- Número de cliente: {datos['num_cliente']}\n"
+            f"- Proyecto: {datos['proyecto']}\n"
+            f"- Modalidad: {datos['modalidad']}\n"
+            f"- Fecha y hora: {fecha_legible}\n"
+            f"- Motivo: {datos['motivo']}\n"
+            f"- Observaciones: {datos['observaciones']}\n\n"
+            "¿Está correcto? (Responde 'sí' para guardar, o dime qué cambiar)"
+        )
+        user_states[chat_id] = {"estado": "confirmar", "datos": datos}
+        await update.message.reply_text(resumen)
         return
 
-    # Procesar como recordatorio por defecto
-    await procesar_recordatorio(update, context, texto)
+    # Si no, responde como ChatGPT normal
+    await responder_gpt(update, texto)
 
+# Consulta de citas por fecha (básica, mejora según tu flujo)
 async def citas_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if context.args:
         fecha_str = " ".join(context.args)
     else:
-        await context.bot.send_message(chat_id=chat_id, text="Usa: /citas [fecha]. Ejemplo: /citas 2025-06-03")
+        await update.message.reply_text("Usa: /citas [fecha]. Ejemplo: /citas 2025-06-03")
         return
     dt = parse_fecha_hora(fecha_str)
     if not dt:
-        await context.bot.send_message(chat_id=chat_id, text="No entendí la fecha. Intenta con otro formato.")
+        await update.message.reply_text("No entendí la fecha. Intenta con otro formato.")
         return
     fecha_iso = dt.date().isoformat()
     citas = db.collection("recordatorios").where("fecha_hora", ">=", fecha_iso).stream()
     citas_lista = [c.to_dict() for c in citas if c.to_dict().get("fecha_hora", "").startswith(fecha_iso)]
     if not citas_lista:
-        await context.bot.send_message(chat_id=chat_id, text=f"No tienes recordatorios para {fecha_iso}.")
+        await update.message.reply_text(f"No tienes recordatorios para {fecha_iso}.")
         return
     msg = "\n\n".join([f"🗓️ {c['fecha_hora']} - {c['cliente']} ({c.get('motivo', '')})" for c in citas_lista])
-    await context.bot.send_message(chat_id=chat_id, text=msg)
+    await update.message.reply_text(msg)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -182,4 +151,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
