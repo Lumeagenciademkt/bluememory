@@ -26,6 +26,34 @@ db = firestore.client()
 CAMPOS = ["cliente", "num_cliente", "proyecto", "modalidad", "fecha_hora", "observaciones"]
 user_states = {}
 
+# Sinónimos y variantes flexibles para los campos (clave real -> lista de variantes aceptadas)
+CAMPO_FLEX = {
+    "cliente": ["cliente"],
+    "num_cliente": ["num cliente", "número cliente", "numero cliente", "número de cliente", "numero de cliente"],
+    "proyecto": ["proyecto"],
+    "modalidad": ["modalidad"],
+    "fecha_hora": ["fecha hora", "fecha y hora", "hora", "fecha"],
+    "observaciones": ["observacion", "observaciones", "observación", "observaciones", "nota", "notas"]
+}
+
+# Convierte entrada usuario a campo real si coincide con alguna variante
+def campo_a_clave(campo_usuario):
+    campo_usuario = campo_usuario.replace("_", " ").strip().lower()
+    for clave, variantes in CAMPO_FLEX.items():
+        if campo_usuario == clave or campo_usuario in variantes:
+            return clave
+        # Coincidencia parcial
+        for var in variantes:
+            if campo_usuario in var or var in campo_usuario:
+                return clave
+    return None
+
+# Genera la lista de campos para mostrar de manera más natural
+def campos_legibles():
+    return ", ".join([
+        "cliente", "num cliente", "proyecto", "modalidad", "fecha hora", "observaciones"
+    ])
+
 def prompt_gpt_neomind(texto, chat_hist=None):
     prompt = f"""
 Eres un asistente que organiza, consulta y edita recordatorios. El usuario puede preguntar por fecha, cliente, proyecto, modalidad, observaciones, etc.
@@ -179,7 +207,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- MODIFICACIÓN MULTIPASO ---
     if estado == "modificar_elegir":
-        # Usuario elige cuál editar
         idx = None
         try:
             idx = int(texto.strip()) - 1
@@ -191,7 +218,7 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[chat_id]["modificar_doc_id"] = recordatorio["doc_id"]
             user_states[chat_id]["estado"] = "modificar_que_campo"
             await update.message.reply_text(
-                "¿Qué campo deseas modificar? (cliente, num_cliente, proyecto, modalidad, fecha_hora, observaciones)"
+                f"¿Qué campo deseas modificar? ({campos_legibles()})"
             )
             return
         else:
@@ -199,13 +226,18 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if estado == "modificar_que_campo":
-        campo = texto.strip().lower()
-        if campo not in CAMPOS:
-            await update.message.reply_text("Ese campo no es válido. Debe ser uno de: cliente, num_cliente, proyecto, modalidad, fecha_hora, observaciones.")
+        campo_usuario = texto.strip().replace("_", " ").lower()
+        campo_clave = campo_a_clave(campo_usuario)
+        if not campo_clave or campo_clave not in CAMPOS:
+            await update.message.reply_text(
+                f"⚠️ Ese campo no es válido. Debe ser uno de: {campos_legibles()}."
+            )
             return
-        user_states[chat_id]["modificar_campo"] = campo
+        user_states[chat_id]["modificar_campo"] = campo_clave
         user_states[chat_id]["estado"] = "modificar_nuevo_valor"
-        await update.message.reply_text(f"¿Cuál es el nuevo valor para '{campo}'?")
+        await update.message.reply_text(
+            f"¿Cuál es el nuevo valor para '{campo_clave.replace('_',' ')}'?"
+        )
         return
 
     if estado == "modificar_nuevo_valor":
@@ -228,7 +260,7 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_states[chat_id]["estado"] = "modificar_confirmar"
         await update.message.reply_text(
-            f"¿Confirma que deseas modificar el campo '{campo}' a:\n{display_val}\n\nResponde sí para confirmar."
+            f"¿Confirma que deseas modificar el campo '{campo.replace('_',' ')}' a:\n{display_val}\n\nResponde sí para confirmar."
         )
         return
 
@@ -237,7 +269,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc_id = user_states[chat_id]["modificar_doc_id"]
             campo = user_states[chat_id]["modificar_campo"]
             nuevo_valor = user_states[chat_id]["modificar_nuevo_valor"]
-            # Actualiza en Firestore
             db.collection("recordatorios").document(doc_id).update({campo: nuevo_valor})
             await update.message.reply_text("✅ ¡Recordatorio modificado correctamente!")
             user_states[chat_id] = {}
@@ -324,22 +355,19 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if gpt_result["intencion"] == "modificar":
-        # Buscar los recordatorios que coinciden para modificación
         campo = gpt_result.get("busqueda", {}).get("campo", "")
         valor = gpt_result.get("busqueda", {}).get("valor", "")
         citas_lista, msg_head = await consulta_citas(update, context, None, campo, valor)
         if not citas_lista:
             await update.message.reply_text("No encontré recordatorios para modificar según tu criterio. Intenta ser más específico.")
             return
-        # Si hay uno solo, ir directo al campo a modificar
         if len(citas_lista) == 1:
             user_states[chat_id]["modificar_doc_id"] = citas_lista[0]["doc_id"]
             user_states[chat_id]["estado"] = "modificar_que_campo"
             await update.message.reply_text(
-                f"Este es el recordatorio encontrado:\n🗓️ {citas_lista[0].get('fecha_hora','')[:16].replace('T', ' ')} - {citas_lista[0].get('cliente','')} ({citas_lista[0].get('proyecto','')})\nObs: {citas_lista[0].get('observaciones','')}\n\n¿Qué campo deseas modificar? (cliente, num_cliente, proyecto, modalidad, fecha_hora, observaciones)"
+                f"Este es el recordatorio encontrado:\n🗓️ {citas_lista[0].get('fecha_hora','')[:16].replace('T', ' ')} - {citas_lista[0].get('cliente','')} ({citas_lista[0].get('proyecto','')})\nObs: {citas_lista[0].get('observaciones','')}\n\n¿Qué campo deseas modificar? ({campos_legibles()})"
             )
         else:
-            # Si hay varios, mostrar lista numerada y pedir elegir
             msg = "Se encontraron varios recordatorios. Responde con el número de la lista para elegir cuál modificar:\n\n"
             for idx, c in enumerate(citas_lista, 1):
                 f = c.get("fecha_hora", "")[:16].replace("T", " ")
@@ -395,3 +423,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
