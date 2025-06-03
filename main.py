@@ -11,6 +11,7 @@ import dateparser
 import re
 import json
 from rapidfuzz import fuzz
+import asyncio
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -26,7 +27,6 @@ db = firestore.client()
 CAMPOS = ["cliente", "num_cliente", "proyecto", "modalidad", "fecha_hora", "observaciones"]
 user_states = {}
 
-# Sinónimos y variantes flexibles para los campos (clave real -> lista de variantes aceptadas)
 CAMPO_FLEX = {
     "cliente": ["cliente"],
     "num_cliente": ["num cliente", "número cliente", "numero cliente", "número de cliente", "numero de cliente"],
@@ -36,19 +36,16 @@ CAMPO_FLEX = {
     "observaciones": ["observacion", "observaciones", "observación", "observaciones", "nota", "notas"]
 }
 
-# Convierte entrada usuario a campo real si coincide con alguna variante
 def campo_a_clave(campo_usuario):
     campo_usuario = campo_usuario.replace("_", " ").strip().lower()
     for clave, variantes in CAMPO_FLEX.items():
         if campo_usuario == clave or campo_usuario in variantes:
             return clave
-        # Coincidencia parcial
         for var in variantes:
             if campo_usuario in var or var in campo_usuario:
                 return clave
     return None
 
-# Genera la lista de campos para mostrar de manera más natural
 def campos_legibles():
     return ", ".join([
         "cliente", "num cliente", "proyecto", "modalidad", "fecha hora", "observaciones"
@@ -176,7 +173,7 @@ async def consulta_observaciones_similar(update, context, query_text):
         d = r.to_dict()
         obs = d.get("observaciones", "")
         score = fuzz.token_set_ratio(query_text.lower(), obs.lower())
-        if score > 60:  # umbral ajustable
+        if score > 60:
             resultados.append((score, d))
     if not resultados:
         await update.message.reply_text("No encontré ningún recordatorio que coincida lo suficiente en las observaciones.")
@@ -337,10 +334,8 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[chat_id] = {}
             return
 
-    # --- NEOMIND LOGIC: NUEVO FLUJO DE MODIFICAR ---
     gpt_result = prompt_gpt_neomind(texto)
 
-    # Búsqueda difusa por observaciones si no detecta campo ni fecha pero el mensaje es descriptivo
     if (
         gpt_result["intencion"] == "consultar"
         and not gpt_result.get("busqueda", {}).get("campo", "")
@@ -377,7 +372,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
         return
 
-    # --- FLUJO ANTERIOR (consultar/agendar) ---
     if gpt_result["intencion"] == "consultar":
         campo = gpt_result.get("busqueda", {}).get("campo", "")
         valor = gpt_result.get("busqueda", {}).get("valor", "")
@@ -412,13 +406,50 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
             return
 
-    # Si no entiende la intención, responde como ChatGPT
     await responder_gpt(update, texto)
+
+# --------- SCHEDULER DE RECORDATORIOS ---------
+async def scheduler_loop(app):
+    while True:
+        now = datetime.now(pytz.timezone("America/Lima"))
+        docs = db.collection("recordatorios").stream()
+        for doc in docs:
+            d = doc.to_dict()
+            chat_id = d.get("telegram_id")
+            fecha_hora = d.get("fecha_hora")
+            if not fecha_hora or not chat_id:
+                continue
+            dt = dateparser.parse(fecha_hora)
+            if not dt:
+                continue
+            # 10 minutos antes
+            if not d.get("avisado_10min") and 0 <= (dt - now).total_seconds() <= 600:
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⏰ ¡Tienes un recordatorio en 10 minutos!\n{d.get('cliente', '')} ({d.get('proyecto','')})\nObs: {d.get('observaciones','')}"
+                    )
+                    db.collection("recordatorios").document(doc.id).update({"avisado_10min": True})
+                except Exception as e:
+                    print(f"Error avisando 10min antes: {e}")
+            # Exacto en la hora
+            if not d.get("avisado_hora") and -60 <= (dt - now).total_seconds() <= 60:
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⏰ ¡Es la hora de tu recordatorio!\n{d.get('cliente', '')} ({d.get('proyecto','')})\nObs: {d.get('observaciones','')}"
+                    )
+                    db.collection("recordatorios").document(doc.id).update({"avisado_hora": True})
+                except Exception as e:
+                    print(f"Error avisando en la hora: {e}")
+        await asyncio.sleep(60)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_handler))
     print("Bot Neomind iniciado...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(scheduler_loop(app))
     app.run_polling()
 
 if __name__ == "__main__":
