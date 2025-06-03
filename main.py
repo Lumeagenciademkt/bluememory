@@ -5,7 +5,7 @@ from firebase_admin import credentials, firestore
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import dateparser
 import re
@@ -22,30 +22,34 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Sin 'motivo'
 CAMPOS = ["cliente", "num_cliente", "proyecto", "modalidad", "fecha_hora", "observaciones"]
-
-# Memoria de usuario (hasta 20 mensajes)
 user_states = {}
 
-def extraer_intencion(texto):
-    patrones = ["agenda", "agendar", "cita", "recordatorio", "reunión", "reunion", "recuerda", "avísame"]
-    return any(pat in texto.lower() for pat in patrones)
-
-def extraer_datos_gpt(texto):
-    prompt = f"""Eres un asistente que organiza recordatorios. Extrae los siguientes campos (de manera flexible y humana) del usuario:
-Cliente, Número de cliente, Proyecto, Modalidad (presencial/virtual), Fecha y hora, Observaciones.
-Devuelve SOLO el siguiente JSON (deja vacío si no hay info):
+def prompt_gpt_neomind(texto, chat_hist=None):
+    prompt = f"""
+Eres un asistente que ayuda a organizar y consultar recordatorios. Dado el mensaje del usuario, responde solo con este JSON:
 {{
+  "intencion": "consultar" | "agendar" | "otro",
+  "fecha": "",  // Si es consulta, extrae la fecha si la hay. Si no, deja vacío.
+  "campos": {{
     "cliente": "",
     "num_cliente": "",
     "proyecto": "",
     "modalidad": "",
     "fecha_hora": "",
     "observaciones": ""
+  }}
 }}
+Si no entiendes, pon "intencion":"otro".
+
+Ejemplo:
+Usuario: "Quiero saber mis recordatorios para el viernes" → intencion: "consultar", fecha: "próximo viernes", campos: {{}}
+Usuario: "Agenda cita con Juan mañana a las 2" → intencion: "agendar", fecha: "", campos: {{...}}
+Usuario: "¿Cuántos planetas tiene Marte?" → intencion: "otro"
+
 Mensaje del usuario: {texto}
-JSON:"""
+JSON:
+"""
     response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -55,9 +59,21 @@ JSON:"""
     match = re.search(r'\{[\s\S]+\}', content)
     if match:
         return json.loads(match.group(0))
-    return {k: "" for k in CAMPOS}
+    return {"intencion": "otro", "fecha": "", "campos": {k:"" for k in CAMPOS}}
 
-def parse_fecha_hora(fecha_str):
+def parse_fecha_gpt(fecha_str):
+    if not fecha_str:
+        return None
+    if fecha_str.strip().lower() in ["hoy", "ahora"]:
+        return datetime.now(pytz.timezone("America/Lima")).date()
+    if fecha_str.strip().lower() == "mañana":
+        return (datetime.now(pytz.timezone("America/Lima")) + timedelta(days=1)).date()
+    dt = dateparser.parse(fecha_str, languages=['es'])
+    if dt:
+        return dt.date()
+    return None
+
+def parse_fecha_hora_gpt(fecha_str):
     if not fecha_str:
         return None
     dt = dateparser.parse(fecha_str, languages=['es'])
@@ -67,7 +83,7 @@ def parse_fecha_hora(fecha_str):
 
 def build_resumen(datos):
     fecha_legible = datos.get("fecha_hora", "")
-    dt = parse_fecha_hora(fecha_legible)
+    dt = parse_fecha_hora_gpt(fecha_legible)
     if dt:
         fecha_legible = dt.strftime("%d de %B de %Y, %I:%M %p")
         datos["fecha_hora"] = dt.isoformat()
@@ -82,8 +98,32 @@ def build_resumen(datos):
         "¿Está correcto? (Responde 'sí' para guardar, o dime qué cambiar)"
     )
 
+async def consulta_citas(update, context, fecha=None):
+    chat_id = update.effective_chat.id
+    now = datetime.now(pytz.timezone("America/Lima"))
+    hoy = now.date().isoformat()
+
+    if fecha:
+        fecha_iso = fecha.isoformat()
+        citas = db.collection("recordatorios").where("fecha_hora", ">=", fecha_iso).stream()
+        citas_lista = [c.to_dict() for c in citas if c.to_dict().get("fecha_hora", "").startswith(fecha_iso)]
+        msg_head = f"Recordatorios para {fecha.strftime('%d de %B de %Y')}:"
+    else:
+        # Próximos desde hoy
+        citas = db.collection("recordatorios").where("fecha_hora", ">=", hoy).stream()
+        citas_lista = [c.to_dict() for c in citas]
+        msg_head = "Tus recordatorios pendientes:"
+
+    if not citas_lista:
+        msg = f"No tienes recordatorios{' para esa fecha' if fecha else ' pendientes'}."
+    else:
+        msg = msg_head + "\n\n"
+        for c in citas_lista:
+            f = c.get("fecha_hora", "")[:16].replace("T", " ")
+            msg += f"🗓️ {f} - {c.get('cliente','')} ({c.get('proyecto','')})\nObs: {c.get('observaciones','')}\n\n"
+    await update.message.reply_text(msg)
+
 async def responder_gpt(update, texto):
-    # Responde como ChatGPT normal
     response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": texto}],
@@ -95,23 +135,19 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     texto = update.message.text.strip()
 
-    # Prepara historial de usuario
     if chat_id not in user_states:
-        user_states[chat_id] = {"hist": []}
-    # Memoria corta: guarda los últimos 20 mensajes del usuario
-    user_states[chat_id]["hist"].append(texto)
-    user_states[chat_id]["hist"] = user_states[chat_id]["hist"][-20:]
+        user_states[chat_id] = {}
 
     estado = user_states[chat_id].get("estado", None)
 
-    # Confirmación de guardado
+    # Confirmación para guardar recordatorio
     if estado == "confirmar":
         if texto.lower() in ["sí", "si", "ok", "dale", "confirmo"]:
             datos = user_states[chat_id]["datos"]
             now = datetime.now(pytz.timezone("America/Lima"))
             datos["fecha_creacion"] = now.isoformat()
             db.collection("recordatorios").add(datos)
-            user_states[chat_id] = {"hist": user_states[chat_id]["hist"]}
+            user_states[chat_id] = {}
             await update.message.reply_text("✅ ¡Recordatorio guardado! Te avisaré a la hora indicada y 10 minutos antes.")
             return
         elif texto.lower() in ["no", "cambiar", "editar", "modificar"]:
@@ -120,61 +156,44 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         else:
             # Si manda información nueva, reintentar extracción y confirmación
-            datos = extraer_datos_gpt(texto)
+            gpt_result = prompt_gpt_neomind(texto)
+            datos = gpt_result.get("campos", {})
             resumen = build_resumen(datos)
             user_states[chat_id]["datos"] = datos
             await update.message.reply_text(resumen)
             return
 
-    # Flujo: agendar recordatorio (intención o estado pendiente)
-    if extraer_intencion(texto) or estado == "pendiente":
-        # Analiza todos los mensajes del historial para extraer datos completos
-        texto_completo = "\n".join(user_states[chat_id]["hist"])
-        datos = extraer_datos_gpt(texto_completo)
-        if all(datos[k] for k in CAMPOS):
+    # Modo Neomind: interpretación global de la intención (via GPT-4o)
+    gpt_result = prompt_gpt_neomind(texto)
+
+    if gpt_result["intencion"] == "consultar":
+        fecha = parse_fecha_gpt(gpt_result.get("fecha", ""))
+        await consulta_citas(update, context, fecha)
+        return
+
+    if gpt_result["intencion"] == "agendar":
+        datos = gpt_result["campos"]
+        if all(datos.get(k, "") for k in CAMPOS):
             resumen = build_resumen(datos)
             user_states[chat_id]["datos"] = datos
             user_states[chat_id]["estado"] = "confirmar"
             await update.message.reply_text(resumen)
             return
         else:
-            # Si falta algún dato, pide sólo lo faltante
-            faltantes = [k for k in CAMPOS if not datos[k]]
+            faltantes = [k for k in CAMPOS if not datos.get(k, "")]
             msg = "Por favor, indícame: " + ", ".join(faltantes)
             user_states[chat_id]["datos"] = datos
             user_states[chat_id]["estado"] = "pendiente"
             await update.message.reply_text(msg)
             return
 
-    # Default: Chat normal
-    user_states[chat_id]["estado"] = None
+    # Si no entiende la intención, responde como ChatGPT
     await responder_gpt(update, texto)
-
-async def citas_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if context.args:
-        fecha_str = " ".join(context.args)
-    else:
-        await update.message.reply_text("Usa: /citas [fecha]. Ejemplo: /citas 2025-06-03")
-        return
-    dt = parse_fecha_hora(fecha_str)
-    if not dt:
-        await update.message.reply_text("No entendí la fecha. Intenta con otro formato.")
-        return
-    fecha_iso = dt.date().isoformat()
-    citas = db.collection("recordatorios").where("fecha_hora", ">=", fecha_iso).stream()
-    citas_lista = [c.to_dict() for c in citas if c.to_dict().get("fecha_hora", "").startswith(fecha_iso)]
-    if not citas_lista:
-        await update.message.reply_text(f"No tienes recordatorios para {fecha_iso}.")
-        return
-    msg = "\n\n".join([f"🗓️ {c['fecha_hora']} - {c['cliente']} ({c.get('observaciones', '')})" for c in citas_lista])
-    await update.message.reply_text(msg)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("citas", citas_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_handler))
-    print("Bot iniciado...")
+    print("Bot Neomind iniciado...")
     app.run_polling()
 
 if __name__ == "__main__":
