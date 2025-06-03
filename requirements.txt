@@ -1,6 +1,6 @@
-openai==1.23.2
 python-telegram-bot==20.3
+openai==1.23.2
 firebase-admin==6.4.0
 python-dotenv==1.0.1
 pytz==2024.1
-APScheduler==3.10.4
+dateparser==1.2.0
