@@ -181,7 +181,10 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         else:
             faltantes = [k for k in CAMPOS if not datos.get(k, "")]
-            msg = "Por favor, indícame: " + ", ".join(faltantes)
+            if len(faltantes) > 1:
+                msg = "Por favor, indícame los siguientes datos:\n" + "\n".join([f"- {campo.replace('_', ' ').capitalize()}" for campo in faltantes])
+            else:
+                msg = "Por favor, indícame:\n" + "\n".join([f"- {campo.replace('_', ' ').capitalize()}" for campo in faltantes])
             user_states[chat_id]["datos"] = datos
             user_states[chat_id]["estado"] = "pendiente"
             await update.message.reply_text(msg)
@@ -198,3 +201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
