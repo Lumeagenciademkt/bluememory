@@ -3,7 +3,7 @@ import openai
 import firebase_admin
 from firebase_admin import credentials, firestore
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import pytz
@@ -27,10 +27,16 @@ user_states = {}
 
 def prompt_gpt_neomind(texto, chat_hist=None):
     prompt = f"""
-Eres un asistente que ayuda a organizar y consultar recordatorios. Dado el mensaje del usuario, responde solo con este JSON:
+Eres un asistente que organiza y consulta recordatorios de múltiples usuarios. El usuario puede preguntar por fecha, cliente, proyecto, modalidad, observaciones, etc.
+Devuelve SOLO este JSON:
+
 {{
   "intencion": "consultar" | "agendar" | "otro",
-  "fecha": "",  // Si es consulta, extrae la fecha si la hay. Si no, deja vacío.
+  "fecha": "",
+  "busqueda": {{
+    "campo": "",
+    "valor": ""
+  }},
   "campos": {{
     "cliente": "",
     "num_cliente": "",
@@ -40,14 +46,10 @@ Eres un asistente que ayuda a organizar y consultar recordatorios. Dado el mensa
     "observaciones": ""
   }}
 }}
-Si no entiendes, pon "intencion":"otro".
-
-Ejemplo:
-Usuario: "Quiero saber mis recordatorios para el viernes" → intencion: "consultar", fecha: "próximo viernes", campos: {{}}
-Usuario: "Agenda cita con Juan mañana a las 2" → intencion: "agendar", fecha: "", campos: {{...}}
-Usuario: "¿Cuántos planetas tiene Marte?" → intencion: "otro"
-
-Mensaje del usuario: {texto}
+- Si la búsqueda es general (“¿qué citas tengo?”) deja campo y valor vacíos.
+- Si la búsqueda es por campo (“¿cuándo es mi reunión con Abelardo?”), pon "campo": "cliente" y "valor": "Abelardo".
+- Si es agendar, pon los datos en "campos".
+Mensaje: {texto}
 JSON:
 """
     response = openai.chat.completions.create(
@@ -59,7 +61,12 @@ JSON:
     match = re.search(r'\{[\s\S]+\}', content)
     if match:
         return json.loads(match.group(0))
-    return {"intencion": "otro", "fecha": "", "campos": {k:"" for k in CAMPOS}}
+    return {
+        "intencion": "otro",
+        "fecha": "",
+        "busqueda": {"campo": "", "valor": ""},
+        "campos": {k: "" for k in CAMPOS}
+    }
 
 def parse_fecha_gpt(fecha_str):
     if not fecha_str:
@@ -98,24 +105,29 @@ def build_resumen(datos):
         "¿Está correcto? (Responde 'sí' para guardar, o dime qué cambiar)"
     )
 
-async def consulta_citas(update, context, fecha=None):
+async def consulta_citas(update, context, fecha=None, campo=None, valor=None):
     chat_id = update.effective_chat.id
-    now = datetime.now(pytz.timezone("America/Lima"))
-    hoy = now.date().isoformat()
+    user_id = chat_id
+
+    query = db.collection("recordatorios").where("telegram_id", "==", user_id)
 
     if fecha:
         fecha_iso = fecha.isoformat()
-        citas = db.collection("recordatorios").where("fecha_hora", ">=", fecha_iso).stream()
+        citas = query.stream()
         citas_lista = [c.to_dict() for c in citas if c.to_dict().get("fecha_hora", "").startswith(fecha_iso)]
         msg_head = f"Recordatorios para {fecha.strftime('%d de %B de %Y')}:"
+    elif campo and valor:
+        citas = query.stream()
+        citas_lista = [c.to_dict() for c in citas if valor.lower() in str(c.to_dict().get(campo, "")).lower()]
+        msg_head = f"Tus recordatorios por {campo.replace('_',' ')}: {valor}"
     else:
-        # Próximos desde hoy
-        citas = db.collection("recordatorios").where("fecha_hora", ">=", hoy).stream()
+        hoy = datetime.now(pytz.timezone("America/Lima")).date().isoformat()
+        citas = query.where("fecha_hora", ">=", hoy).stream()
         citas_lista = [c.to_dict() for c in citas]
         msg_head = "Tus recordatorios pendientes:"
 
     if not citas_lista:
-        msg = f"No tienes recordatorios{' para esa fecha' if fecha else ' pendientes'}."
+        msg = f"No tienes recordatorios{' para esa búsqueda' if campo else (' para esa fecha' if fecha else ' pendientes')}."
     else:
         msg = msg_head + "\n\n"
         for c in citas_lista:
@@ -146,6 +158,8 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             datos = user_states[chat_id]["datos"]
             now = datetime.now(pytz.timezone("America/Lima"))
             datos["fecha_creacion"] = now.isoformat()
+            datos["telegram_id"] = chat_id
+            datos["telegram_user"] = update.effective_user.username or update.effective_user.full_name
             db.collection("recordatorios").add(datos)
             user_states[chat_id] = {}
             await update.message.reply_text("✅ ¡Recordatorio guardado! Te avisaré a la hora indicada y 10 minutos antes.")
@@ -155,7 +169,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[chat_id]["estado"] = "pendiente"
             return
         else:
-            # Si manda información nueva, reintentar extracción y confirmación
             gpt_result = prompt_gpt_neomind(texto)
             datos = gpt_result.get("campos", {})
             resumen = build_resumen(datos)
@@ -163,13 +176,34 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(resumen)
             return
 
+    # Confirmación para búsqueda por campo
+    if estado == "confirmar_busqueda":
+        if texto.lower() in ["sí", "si", "ok", "dale", "confirmo"]:
+            campo = user_states[chat_id]["busqueda"]["campo"]
+            valor = user_states[chat_id]["busqueda"]["valor"]
+            await consulta_citas(update, context, None, campo, valor)
+            user_states[chat_id] = {}
+            return
+        else:
+            await update.message.reply_text("OK, búsqueda cancelada.")
+            user_states[chat_id] = {}
+            return
+
     # Modo Neomind: interpretación global de la intención (via GPT-4o)
     gpt_result = prompt_gpt_neomind(texto)
 
     if gpt_result["intencion"] == "consultar":
+        campo = gpt_result.get("busqueda", {}).get("campo", "")
+        valor = gpt_result.get("busqueda", {}).get("valor", "")
         fecha = parse_fecha_gpt(gpt_result.get("fecha", ""))
-        await consulta_citas(update, context, fecha)
-        return
+        if campo and valor:
+            user_states[chat_id]["estado"] = "confirmar_busqueda"
+            user_states[chat_id]["busqueda"] = {"campo": campo, "valor": valor}
+            await update.message.reply_text(f"¿Deseas buscar en tus recordatorios por {campo.replace('_',' ')}: {valor}? (Responde sí para confirmar)")
+            return
+        else:
+            await consulta_citas(update, context, fecha)
+            return
 
     if gpt_result["intencion"] == "agendar":
         datos = gpt_result["campos"]
@@ -201,4 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
