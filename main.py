@@ -11,7 +11,6 @@ import dateparser
 import re
 import json
 from rapidfuzz import fuzz
-import asyncio
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -446,78 +445,77 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await responder_gpt(update, texto)
 
 # --------- SCHEDULER DE RECORDATORIOS MEJORADO ---------
-async def scheduler_loop(app):
-    while True:
-        now = datetime.now(pytz.timezone("America/Lima"))
-        hoy_str = now.strftime("%Y-%m-%d")
-        docs = db.collection("recordatorios").stream()
-        for doc in docs:
-            d = doc.to_dict()
-            chat_id = d.get("telegram_id")
-            fecha_hora = d.get("fecha_hora")
-            if not fecha_hora or not chat_id:
-                continue
-            dt = dateparser.parse(fecha_hora)
-            if not dt:
-                continue
-            if dt.tzinfo is None:
-                dt = pytz.timezone("America/Lima").localize(dt)
-            if dt.strftime("%Y-%m-%d") != hoy_str:
-                continue
+async def recordatorios_job(context: ContextTypes.DEFAULT_TYPE):
+    """Revisa los recordatorios y envía avisos."""
+    app = context.application
+    now = datetime.now(pytz.timezone("America/Lima"))
+    hoy_str = now.strftime("%Y-%m-%d")
+    docs = db.collection("recordatorios").stream()
+    for doc in docs:
+        d = doc.to_dict()
+        chat_id = d.get("telegram_id")
+        fecha_hora = d.get("fecha_hora")
+        if not fecha_hora or not chat_id:
+            continue
+        dt = dateparser.parse(fecha_hora)
+        if not dt:
+            continue
+        if dt.tzinfo is None:
+            dt = pytz.timezone("America/Lima").localize(dt)
+        if dt.strftime("%Y-%m-%d") != hoy_str:
+            continue
 
-            cliente = d.get('cliente', '')
-            num_cliente = d.get('num_cliente', '')
-            proyecto = d.get('proyecto', '')
-            obs = d.get('observaciones', '')
-            telegram_user = d.get('telegram_user', '')
+        cliente = d.get('cliente', '')
+        num_cliente = d.get('num_cliente', '')
+        proyecto = d.get('proyecto', '')
+        obs = d.get('observaciones', '')
+        telegram_user = d.get('telegram_user', '')
 
-            # Nueva línea: Formatea la fecha y hora para mostrar en el mensaje
-            fecha_legible = dt.strftime("%d/%m/%Y %I:%M %p")
+        # Formatea la fecha y hora para mostrar en el mensaje
+        fecha_legible = dt.strftime("%d/%m/%Y %I:%M %p")
 
-            # Mención/tag
-            if telegram_user:
-                if telegram_user.startswith("@"):
-                    tag = telegram_user
-                else:
-                    tag = f"@{telegram_user.replace(' ', '')}"
+        # Mención/tag
+        if telegram_user:
+            if telegram_user.startswith("@"): 
+                tag = telegram_user
             else:
-                tag = ""
+                tag = f"@{telegram_user.replace(' ', '')}"
+        else:
+            tag = ""
 
-            # 10 minutos antes
-            if not d.get("avisado_10min") and 0 <= (dt - now).total_seconds() <= 600:
-                try:
-                    msg = (f"⏰ ¡Tienes un recordatorio en 10 minutos!\n"
-                           f"{cliente} ({proyecto})\n"
-                           f"Número: {num_cliente}\n"
-                           f"Fecha y hora: {fecha_legible}\n"
-                           f"Obs: {obs}\n"
-                           f"{tag}")
-                    await app.bot.send_message(chat_id=chat_id, text=msg)
-                    db.collection("recordatorios").document(doc.id).update({"avisado_10min": True})
-                except Exception as e:
-                    print(f"Error avisando 10min antes: {e}")
+        # 10 minutos antes
+        if not d.get("avisado_10min") and 0 <= (dt - now).total_seconds() <= 600:
+            try:
+                msg = (f"⏰ ¡Tienes un recordatorio en 10 minutos!\n"
+                       f"{cliente} ({proyecto})\n"
+                       f"Número: {num_cliente}\n"
+                       f"Fecha y hora: {fecha_legible}\n"
+                       f"Obs: {obs}\n"
+                       f"{tag}")
+                await app.bot.send_message(chat_id=chat_id, text=msg)
+                db.collection("recordatorios").document(doc.id).update({"avisado_10min": True})
+            except Exception as e:
+                print(f"Error avisando 10min antes: {e}")
 
-            # Exacto en la hora
-            if not d.get("avisado_hora") and -60 <= (dt - now).total_seconds() <= 60:
-                try:
-                    msg = (f"⏰ ¡Es la hora de tu recordatorio!\n"
-                           f"{cliente} ({proyecto})\n"
-                           f"Número: {num_cliente}\n"
-                           f"Fecha y hora: {fecha_legible}\n"
-                           f"Obs: {obs}\n"
-                           f"{tag}")
-                    await app.bot.send_message(chat_id=chat_id, text=msg)
-                    db.collection("recordatorios").document(doc.id).update({"avisado_hora": True})
-                except Exception as e:
-                    print(f"Error avisando en la hora: {e}")
-        await asyncio.sleep(60)
+        # Exacto en la hora
+        if not d.get("avisado_hora") and -60 <= (dt - now).total_seconds() <= 60:
+            try:
+                msg = (f"⏰ ¡Es la hora de tu recordatorio!\n"
+                       f"{cliente} ({proyecto})\n"
+                       f"Número: {num_cliente}\n"
+                       f"Fecha y hora: {fecha_legible}\n"
+                       f"Obs: {obs}\n"
+                       f"{tag}")
+                await app.bot.send_message(chat_id=chat_id, text=msg)
+                db.collection("recordatorios").document(doc.id).update({"avisado_hora": True})
+            except Exception as e:
+                print(f"Error avisando en la hora: {e}")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_handler))
     print("Bot Neomind iniciado...")
-    loop = asyncio.get_event_loop()
-    loop.create_task(scheduler_loop(app))
+    app.job_queue.run_repeating(recordatorios_job, interval=60, first=0)
     app.run_polling()
 
 if __name__ == "__main__":
