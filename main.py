@@ -3,7 +3,7 @@ import openai
 import firebase_admin
 from firebase_admin import credentials, firestore
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import pytz
@@ -193,9 +193,22 @@ async def responder_gpt(update, texto):
     )
     await update.message.reply_text(response.choices[0].message.content.strip())
 
+async def get_chat_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or "(Privado)"
+    await update.message.reply_text(f"🆔 El chat_id de este {'grupo' if update.effective_chat.type in ['group', 'supergroup'] else 'chat'} es:\n`{chat_id}`\nNombre: {chat_title}", parse_mode="Markdown")
+
 async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    texto = update.message.text.strip()
+    texto = update.message.text.strip() if update.message.text else ""
+    chat_type = update.effective_chat.type
+    bot_username = context.bot.username.lower()
+
+    # --- SOLO RESPONDE EN GRUPO SI LO ETIQUETAN ---
+    if chat_type in ["group", "supergroup"]:
+        if f"@{bot_username}" not in texto.lower():
+            return
+        texto = texto.replace(f"@{bot_username}", "").strip()
 
     if chat_id not in user_states:
         user_states[chat_id] = {}
@@ -532,6 +545,7 @@ async def scheduler_loop(app):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("getid", get_chat_id_handler))  # Para obtener el ID
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_handler))
     print("Bot Neomind iniciado...")
     loop = asyncio.get_event_loop()
