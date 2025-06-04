@@ -17,6 +17,8 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GRUPO_TELEGRAM_ID = os.getenv("GRUPO_TELEGRAM_ID")  # <-- grupo del .env
+
 openai.api_key = OPENAI_API_KEY
 
 if not firebase_admin._apps:
@@ -346,6 +348,30 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.collection("recordatorios").add(datos)
             user_states[chat_id] = {}
             await update.message.reply_text("✅ ¡Recordatorio guardado! Te avisaré a la hora indicada y 10 minutos antes.")
+            # ----------- ENVÍA AL GRUPO EL RESUMEN -----------
+            if GRUPO_TELEGRAM_ID:
+                try:
+                    creador = datos.get("telegram_user", "")
+                    if creador and not str(creador).startswith("@"):
+                        creador = f"@{str(creador).replace(' ', '_')}"
+                    resumen = (
+                        f"📅 *Nuevo recordatorio guardado!*\n"
+                        f"👤 *Cliente:* {datos.get('cliente','')}\n"
+                        f"📞 *Número:* {datos.get('num_cliente','')}\n"
+                        f"🏗️ *Proyecto:* {datos.get('proyecto','')}\n"
+                        f"💡 *Modalidad:* {datos.get('modalidad','')}\n"
+                        f"🗓️ *Fecha y hora:* {datos.get('fecha_hora','')}\n"
+                        f"📝 *Observaciones:* {datos.get('observaciones','')}\n"
+                        f"\n_Recordatorio creado por {creador}_"
+                    )
+                    await context.bot.send_message(
+                        chat_id=int(GRUPO_TELEGRAM_ID),
+                        text=resumen,
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    print(f"Error enviando mensaje al grupo: {e}")
+            # -----------------------------------------------
             return
         elif texto.lower() in ["no", "cambiar", "editar", "modificar"]:
             await update.message.reply_text("OK, vuelve a escribir la información de tu recordatorio, todos los campos o sólo los que quieras cambiar.")
