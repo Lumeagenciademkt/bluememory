@@ -243,7 +243,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_id = user_states[chat_id]["modificar_doc_id"]
         user_states[chat_id]["modificar_nuevo_valor"] = nuevo_valor
 
-        # Para campos de fecha_hora, intenta parsear bien
         if campo == "fecha_hora":
             dt = parse_fecha_hora_gpt(nuevo_valor)
             if not dt:
@@ -300,7 +299,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(resumen)
             return
 
-    # Confirmación para búsqueda por campo
     if estado == "confirmar_busqueda":
         if texto.lower() in ["sí", "si", "ok", "dale", "confirmo"]:
             campo = user_states[chat_id]["busqueda"]["campo"]
@@ -322,7 +320,6 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[chat_id] = {}
             return
 
-    # Confirmación para búsqueda difusa en observaciones
     if estado == "confirmar_observacion_similar":
         if texto.lower() in ["sí", "si", "ok", "dale", "confirmo"]:
             query_text = user_states[chat_id]["query_text"]
@@ -421,7 +418,11 @@ async def scheduler_loop(app):
             if not fecha_hora or not chat_id:
                 continue
             dt = dateparser.parse(fecha_hora)
-            if not dt or dt.strftime("%Y-%m-%d") != hoy_str:
+            if not dt:
+                continue
+            if dt.tzinfo is None:
+                dt = pytz.timezone("America/Lima").localize(dt)
+            if dt.strftime("%Y-%m-%d") != hoy_str:
                 continue
 
             cliente = d.get('cliente', '')
@@ -430,7 +431,7 @@ async def scheduler_loop(app):
             obs = d.get('observaciones', '')
             telegram_user = d.get('telegram_user', '')
 
-            # Mención
+            # Mención/tag
             if telegram_user:
                 if telegram_user.startswith("@"):
                     tag = telegram_user
@@ -476,3 +477,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
