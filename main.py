@@ -202,7 +202,39 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     estado = user_states[chat_id].get("estado", None)
 
-    # --- MODIFICACIÓN MULTIPASO ---
+    # --- FLUJO MODIFICACIÓN (nuevo robusto) ---
+    if estado == "modificar_pendiente":
+        gpt_result = prompt_gpt_neomind(texto)
+        campo = gpt_result.get("busqueda", {}).get("campo", "")
+        valor = gpt_result.get("busqueda", {}).get("valor", "")
+        fecha = parse_fecha_gpt(gpt_result.get("fecha", ""))
+        if not campo and not valor and not fecha:
+            await update.message.reply_text(
+                "Por favor indícame el cliente o la fecha del recordatorio que deseas modificar."
+            )
+            return
+        citas_lista, msg_head = await consulta_citas(update, context, fecha, campo, valor)
+        if not citas_lista:
+            await update.message.reply_text("No encontré recordatorios para modificar según tu criterio. Intenta ser más específico.")
+            user_states[chat_id] = {}
+            return
+        if len(citas_lista) == 1:
+            user_states[chat_id]["modificar_doc_id"] = citas_lista[0]["doc_id"]
+            user_states[chat_id]["estado"] = "modificar_que_campo"
+            await update.message.reply_text(
+                f"Este es el recordatorio encontrado:\n🗓️ {citas_lista[0].get('fecha_hora','')[:16].replace('T', ' ')} - {citas_lista[0].get('cliente','')} ({citas_lista[0].get('proyecto','')})\nObs: {citas_lista[0].get('observaciones','')}\n\n¿Qué campo deseas modificar? ({campos_legibles()})"
+            )
+        else:
+            msg = "Se encontraron varios recordatorios. Responde con el número de la lista para elegir cuál modificar:\n\n"
+            for idx, c in enumerate(citas_lista, 1):
+                f = c.get("fecha_hora", "")[:16].replace("T", " ")
+                msg += f"{idx}. 🗓️ {f} - {c.get('cliente','')} ({c.get('proyecto','')})\nObs: {c.get('observaciones','')}\n\n"
+            user_states[chat_id]["matches"] = citas_lista
+            user_states[chat_id]["estado"] = "modificar_elegir"
+            await update.message.reply_text(msg)
+        return
+
+    # --- MODIFICACIÓN MULTIPASO ORIGINAL ---
     if estado == "modificar_elegir":
         idx = None
         try:
@@ -333,23 +365,18 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     gpt_result = prompt_gpt_neomind(texto)
 
-    if (
-        gpt_result["intencion"] == "consultar"
-        and not gpt_result.get("busqueda", {}).get("campo", "")
-        and not gpt_result.get("fecha", "")
-        and len(texto.split()) > 5
-    ):
-        user_states[chat_id]["estado"] = "confirmar_observacion_similar"
-        user_states[chat_id]["query_text"] = texto
-        await update.message.reply_text(
-            f"¿Quieres buscar entre las observaciones de tus recordatorios por: '{texto}'? (Responde sí para confirmar)"
-        )
-        return
-
+    # FLUJO DE MODIFICAR, ahora robusto:
     if gpt_result["intencion"] == "modificar":
         campo = gpt_result.get("busqueda", {}).get("campo", "")
         valor = gpt_result.get("busqueda", {}).get("valor", "")
-        citas_lista, msg_head = await consulta_citas(update, context, None, campo, valor)
+        fecha = parse_fecha_gpt(gpt_result.get("fecha", ""))
+        if not campo and not valor and not fecha:
+            user_states[chat_id]["estado"] = "modificar_pendiente"
+            await update.message.reply_text(
+                "¿De qué cliente o de qué fecha es el recordatorio que deseas modificar?"
+            )
+            return
+        citas_lista, msg_head = await consulta_citas(update, context, fecha, campo, valor)
         if not citas_lista:
             await update.message.reply_text("No encontré recordatorios para modificar según tu criterio. Intenta ser más específico.")
             return
@@ -367,6 +394,19 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[chat_id]["matches"] = citas_lista
             user_states[chat_id]["estado"] = "modificar_elegir"
             await update.message.reply_text(msg)
+        return
+
+    if (
+        gpt_result["intencion"] == "consultar"
+        and not gpt_result.get("busqueda", {}).get("campo", "")
+        and not gpt_result.get("fecha", "")
+        and len(texto.split()) > 5
+    ):
+        user_states[chat_id]["estado"] = "confirmar_observacion_similar"
+        user_states[chat_id]["query_text"] = texto
+        await update.message.reply_text(
+            f"¿Quieres buscar entre las observaciones de tus recordatorios por: '{texto}'? (Responde sí para confirmar)"
+        )
         return
 
     if gpt_result["intencion"] == "consultar":
