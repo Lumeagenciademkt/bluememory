@@ -112,7 +112,7 @@ def parse_fecha_gpt(fecha_str):
     if fecha_str.strip().lower() in ["hoy", "ahora"]:
         return datetime.now(pytz.timezone("America/Lima")).date()
     if fecha_str.strip().lower() == "mañana":
-        return (datetime.now(pytz.timezone("America/Lima")) + timedelta(days=1)).date()
+        return (datetime.now(pytz.timezone("America/Lima") ) + timedelta(days=1)).date()
     dt = dateparser.parse(fecha_str, languages=['es'])
     if dt:
         return dt.date()
@@ -142,6 +142,40 @@ def build_resumen(datos):
         f"- Observaciones: {datos.get('observaciones','')}\n\n"
         "¿Está correcto? (Responde 'sí' para guardar, o dime qué cambiar)"
     )
+
+# ==================== NUEVAS FUNCIONES GRUPO/FORMATO BONITO =====================
+
+def build_group_message(datos, username):
+    fecha_legible = datos.get("fecha_hora", "")
+    dt = parse_fecha_hora_gpt(fecha_legible)
+    if dt:
+        fecha_legible = dt.strftime("%Y-%m-%d %H:%M")
+    return (
+        f"📅 *Nueva reunión programada!*\n"
+        f"👤 *Cliente:* {datos.get('cliente','')}\n"
+        f"📞 *Número:* {datos.get('num_cliente','')}\n"
+        f"🏗️ *Proyecto:* {datos.get('proyecto','')}\n"
+        f"💡 *Modalidad:* {datos.get('modalidad','')}\n"
+        f"🗓️ *Fecha y hora:* {fecha_legible}\n"
+        f"📝 *Observaciones:* {datos.get('observaciones','')}\n\n"
+        f"Recordatorio creado por @{username}"
+    )
+
+def build_recordatorio_resumido(datos, tipo, username):
+    # tipo: "10min" o "hora"
+    dt = parse_fecha_hora_gpt(datos.get("fecha_hora", ""))
+    fecha_legible = dt.strftime("%d/%m/%Y %H:%M") if dt else datos.get("fecha_hora","")
+    encabezado = "⏰ *Tienes una reunión en 10 minutos!*" if tipo == "10min" else "⏰ *Es hora de tu reunión!*"
+    return (
+        f"{encabezado}\n"
+        f"👤 *Cliente:* {datos.get('cliente','')}\n"
+        f"📞 *Número:* {datos.get('num_cliente','')}\n"
+        f"🗓️ *Fecha y hora:* {fecha_legible}\n"
+        f"📝 *Observaciones:* {datos.get('observaciones','')}\n"
+        f"Creado por @{username}"
+    )
+
+# ===============================================================================
 
 async def consulta_citas(update, context, fecha=None, campo=None, valor=None):
     chat_id = update.effective_chat.id
@@ -344,34 +378,21 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             now = datetime.now(pytz.timezone("America/Lima"))
             datos["fecha_creacion"] = now.isoformat()
             datos["telegram_id"] = chat_id
-            datos["telegram_user"] = update.effective_user.username or update.effective_user.full_name
+            username = update.effective_user.username or update.effective_user.full_name or "usuario"
+            datos["telegram_user"] = username
             db.collection("recordatorios").add(datos)
             user_states[chat_id] = {}
-            await update.message.reply_text("✅ ¡Recordatorio guardado! Te avisaré a la hora indicada y 10 minutos antes.")
-            # ----------- ENVÍA AL GRUPO EL RESUMEN -----------
+
+            # ENVÍA MENSAJE PRIVADO
+            await update.message.reply_text("✅ ¡Reunión guardada! Te avisaré a la hora indicada y 10 minutos antes.")
+
+            # ENVÍA AL GRUPO
             if GRUPO_TELEGRAM_ID:
                 try:
-                    creador = datos.get("telegram_user", "")
-                    if creador and not str(creador).startswith("@"):
-                        creador = f"@{str(creador).replace(' ', '_')}"
-                    resumen = (
-                        f"📅 *Nuevo recordatorio guardado!*\n"
-                        f"👤 *Cliente:* {datos.get('cliente','')}\n"
-                        f"📞 *Número:* {datos.get('num_cliente','')}\n"
-                        f"🏗️ *Proyecto:* {datos.get('proyecto','')}\n"
-                        f"💡 *Modalidad:* {datos.get('modalidad','')}\n"
-                        f"🗓️ *Fecha y hora:* {datos.get('fecha_hora','')}\n"
-                        f"📝 *Observaciones:* {datos.get('observaciones','')}\n"
-                        f"\n_Recordatorio creado por {creador}_"
-                    )
-                    await context.bot.send_message(
-                        chat_id=int(GRUPO_TELEGRAM_ID),
-                        text=resumen,
-                        parse_mode="Markdown"
-                    )
+                    resumen = build_group_message(datos, username)
+                    await context.bot.send_message(chat_id=int(GRUPO_TELEGRAM_ID), text=resumen, parse_mode="Markdown")
                 except Exception as e:
-                    print(f"Error enviando mensaje al grupo: {e}")
-            # -----------------------------------------------
+                    print("Error enviando al grupo:", e)
             return
         elif texto.lower() in ["no", "cambiar", "editar", "modificar"]:
             await update.message.reply_text("OK, vuelve a escribir la información de tu recordatorio, todos los campos o sólo los que quieras cambiar.")
@@ -528,34 +549,15 @@ async def scheduler_loop(app):
             if dt.strftime("%Y-%m-%d") != hoy_str:
                 continue
 
-            cliente = d.get('cliente', '')
-            num_cliente = d.get('num_cliente', '')
-            proyecto = d.get('proyecto', '')
-            obs = d.get('observaciones', '')
-            telegram_user = d.get('telegram_user', '')
-
-            # Nueva línea: Formatea la fecha y hora para mostrar en el mensaje
-            fecha_legible = dt.strftime("%d/%m/%Y %I:%M %p")
-
-            # Mención/tag
-            if telegram_user:
-                if telegram_user.startswith("@"):
-                    tag = telegram_user
-                else:
-                    tag = f"@{telegram_user.replace(' ', '')}"
-            else:
-                tag = ""
-
+            username = d.get("telegram_user", "") or "usuario"
             # 10 minutos antes
             if not d.get("avisado_10min") and 0 <= (dt - now).total_seconds() <= 600:
                 try:
-                    msg = (f"⏰ ¡Tienes un recordatorio en 10 minutos!\n"
-                           f"{cliente} ({proyecto})\n"
-                           f"Número: {num_cliente}\n"
-                           f"Fecha y hora: {fecha_legible}\n"
-                           f"Obs: {obs}\n"
-                           f"{tag}")
-                    await app.bot.send_message(chat_id=chat_id, text=msg)
+                    msg = build_recordatorio_resumido(d, "10min", username)
+                    await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                    # ENVÍA TAMBIÉN AL GRUPO
+                    if GRUPO_TELEGRAM_ID:
+                        await app.bot.send_message(chat_id=int(GRUPO_TELEGRAM_ID), text=msg, parse_mode="Markdown")
                     db.collection("recordatorios").document(doc.id).update({"avisado_10min": True})
                 except Exception as e:
                     print(f"Error avisando 10min antes: {e}")
@@ -563,13 +565,10 @@ async def scheduler_loop(app):
             # Exacto en la hora
             if not d.get("avisado_hora") and -60 <= (dt - now).total_seconds() <= 60:
                 try:
-                    msg = (f"⏰ ¡Es la hora de tu recordatorio!\n"
-                           f"{cliente} ({proyecto})\n"
-                           f"Número: {num_cliente}\n"
-                           f"Fecha y hora: {fecha_legible}\n"
-                           f"Obs: {obs}\n"
-                           f"{tag}")
-                    await app.bot.send_message(chat_id=chat_id, text=msg)
+                    msg = build_recordatorio_resumido(d, "hora", username)
+                    await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                    if GRUPO_TELEGRAM_ID:
+                        await app.bot.send_message(chat_id=int(GRUPO_TELEGRAM_ID), text=msg, parse_mode="Markdown")
                     db.collection("recordatorios").document(doc.id).update({"avisado_hora": True})
                 except Exception as e:
                     print(f"Error avisando en la hora: {e}")
