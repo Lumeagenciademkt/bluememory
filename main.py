@@ -210,6 +210,12 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         texto = texto.replace(f"@{bot_username}", "").strip()
 
+    # ---- RESET/ST0P: Limpia el estado ----
+    if texto.lower() in ["reset", "/reset", "stop", "/stop", "cancelar", "/cancelar"]:
+        user_states[chat_id] = {}
+        await update.message.reply_text("🔄 Conversación reseteada. Puedes comenzar de nuevo.")
+        return
+
     if chat_id not in user_states:
         user_states[chat_id] = {}
 
@@ -554,4 +560,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
