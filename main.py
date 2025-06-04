@@ -208,6 +208,15 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         campo = gpt_result.get("busqueda", {}).get("campo", "")
         valor = gpt_result.get("busqueda", {}).get("valor", "")
         fecha = parse_fecha_gpt(gpt_result.get("fecha", ""))
+
+        # --- Ajuste: buscar por fecha si el campo incluye "fecha" ---
+        if campo and "fecha" in campo.lower() and valor:
+            fecha_detectada = parse_fecha_gpt(valor)
+            if fecha_detectada:
+                fecha = fecha_detectada
+                campo = ""
+                valor = ""
+
         if not campo and not valor and not fecha:
             await update.message.reply_text(
                 "Por favor indícame el cliente o la fecha del recordatorio que deseas modificar."
@@ -370,6 +379,15 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         campo = gpt_result.get("busqueda", {}).get("campo", "")
         valor = gpt_result.get("busqueda", {}).get("valor", "")
         fecha = parse_fecha_gpt(gpt_result.get("fecha", ""))
+
+        # --- Ajuste: buscar por fecha si el campo incluye "fecha" ---
+        if campo and "fecha" in campo.lower() and valor:
+            fecha_detectada = parse_fecha_gpt(valor)
+            if fecha_detectada:
+                fecha = fecha_detectada
+                campo = ""
+                valor = ""
+
         if not campo and not valor and not fecha:
             user_states[chat_id]["estado"] = "modificar_pendiente"
             await update.message.reply_text(
