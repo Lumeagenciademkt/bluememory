@@ -431,6 +431,9 @@ async def scheduler_loop(app):
             obs = d.get('observaciones', '')
             telegram_user = d.get('telegram_user', '')
 
+            # Nueva línea: Formatea la fecha y hora para mostrar en el mensaje
+            fecha_legible = dt.strftime("%d/%m/%Y %I:%M %p")
+
             # Mención/tag
             if telegram_user:
                 if telegram_user.startswith("@"):
@@ -446,6 +449,7 @@ async def scheduler_loop(app):
                     msg = (f"⏰ ¡Tienes un recordatorio en 10 minutos!\n"
                            f"{cliente} ({proyecto})\n"
                            f"Número: {num_cliente}\n"
+                           f"Fecha y hora: {fecha_legible}\n"
                            f"Obs: {obs}\n"
                            f"{tag}")
                     await app.bot.send_message(chat_id=chat_id, text=msg)
@@ -459,6 +463,7 @@ async def scheduler_loop(app):
                     msg = (f"⏰ ¡Es la hora de tu recordatorio!\n"
                            f"{cliente} ({proyecto})\n"
                            f"Número: {num_cliente}\n"
+                           f"Fecha y hora: {fecha_legible}\n"
                            f"Obs: {obs}\n"
                            f"{tag}")
                     await app.bot.send_message(chat_id=chat_id, text=msg)
