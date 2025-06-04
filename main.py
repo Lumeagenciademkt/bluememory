@@ -408,10 +408,11 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await responder_gpt(update, texto)
 
-# --------- SCHEDULER DE RECORDATORIOS ---------
+# --------- SCHEDULER DE RECORDATORIOS MEJORADO ---------
 async def scheduler_loop(app):
     while True:
         now = datetime.now(pytz.timezone("America/Lima"))
+        hoy_str = now.strftime("%Y-%m-%d")
         docs = db.collection("recordatorios").stream()
         for doc in docs:
             d = doc.to_dict()
@@ -420,25 +421,46 @@ async def scheduler_loop(app):
             if not fecha_hora or not chat_id:
                 continue
             dt = dateparser.parse(fecha_hora)
-            if not dt:
+            if not dt or dt.strftime("%Y-%m-%d") != hoy_str:
                 continue
+
+            cliente = d.get('cliente', '')
+            num_cliente = d.get('num_cliente', '')
+            proyecto = d.get('proyecto', '')
+            obs = d.get('observaciones', '')
+            telegram_user = d.get('telegram_user', '')
+
+            # Mención
+            if telegram_user:
+                if telegram_user.startswith("@"):
+                    tag = telegram_user
+                else:
+                    tag = f"@{telegram_user.replace(' ', '')}"
+            else:
+                tag = ""
+
             # 10 minutos antes
             if not d.get("avisado_10min") and 0 <= (dt - now).total_seconds() <= 600:
                 try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⏰ ¡Tienes un recordatorio en 10 minutos!\n{d.get('cliente', '')} ({d.get('proyecto','')})\nObs: {d.get('observaciones','')}"
-                    )
+                    msg = (f"⏰ ¡Tienes un recordatorio en 10 minutos!\n"
+                           f"{cliente} ({proyecto})\n"
+                           f"Número: {num_cliente}\n"
+                           f"Obs: {obs}\n"
+                           f"{tag}")
+                    await app.bot.send_message(chat_id=chat_id, text=msg)
                     db.collection("recordatorios").document(doc.id).update({"avisado_10min": True})
                 except Exception as e:
                     print(f"Error avisando 10min antes: {e}")
+
             # Exacto en la hora
             if not d.get("avisado_hora") and -60 <= (dt - now).total_seconds() <= 60:
                 try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⏰ ¡Es la hora de tu recordatorio!\n{d.get('cliente', '')} ({d.get('proyecto','')})\nObs: {d.get('observaciones','')}"
-                    )
+                    msg = (f"⏰ ¡Es la hora de tu recordatorio!\n"
+                           f"{cliente} ({proyecto})\n"
+                           f"Número: {num_cliente}\n"
+                           f"Obs: {obs}\n"
+                           f"{tag}")
+                    await app.bot.send_message(chat_id=chat_id, text=msg)
                     db.collection("recordatorios").document(doc.id).update({"avisado_hora": True})
                 except Exception as e:
                     print(f"Error avisando en la hora: {e}")
@@ -454,4 +476,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
